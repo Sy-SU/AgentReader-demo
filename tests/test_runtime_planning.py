@@ -21,7 +21,11 @@ from planning import (
     start_next_step,
 )
 from llm import _to_api_messages
-from runtime import cancel_active_task, run_agent
+from runtime import (
+    DEFAULT_MAX_TASK_LLM_STEPS,
+    cancel_active_task,
+    run_agent,
+)
 from state import append_user_message, create_state
 
 
@@ -464,7 +468,7 @@ class RuntimePlanningTests(unittest.TestCase):
                 "Find evidence",
                 ["Search for the evidence"],
             ),
-            llm_steps=MAX_TASK_LLM_STEPS,
+            llm_steps=DEFAULT_MAX_TASK_LLM_STEPS,
         )
 
         with TemporaryDirectory() as directory:
@@ -538,7 +542,7 @@ class RuntimePlanningTests(unittest.TestCase):
                 "Find evidence",
                 ["Search for evidence"],
             ),
-            llm_steps=MAX_TASK_LLM_STEPS,
+            llm_steps=DEFAULT_MAX_TASK_LLM_STEPS,
         )
 
         answer = run_agent(state)
@@ -547,9 +551,39 @@ class RuntimePlanningTests(unittest.TestCase):
         self.assertEqual(state["plan"]["status"], "failed")
         self.assertEqual(
             state["plan"]["budget"]["llm_steps"],
-            MAX_TASK_LLM_STEPS,
+            DEFAULT_MAX_TASK_LLM_STEPS,
         )
         self.assertIn("LLM 决策上限", answer)
+
+    @patch("runtime.decide_plan_step", return_value=STEP_FINAL)
+    def test_higher_task_llm_limit_allows_thinking_plan_to_continue(
+        self,
+        decide_step,
+    ):
+        state = create_state("Find evidence")
+        state["task_id"] = "task-existing"
+        state["plan"] = record_plan_usage(
+            create_plan(
+                "task-existing",
+                "Find evidence",
+                ["Search for evidence"],
+            ),
+            llm_steps=DEFAULT_MAX_TASK_LLM_STEPS,
+        )
+
+        answer = run_agent(
+            state,
+            max_steps=1,
+            max_task_llm_steps=MAX_TASK_LLM_STEPS,
+        )
+
+        self.assertEqual(answer, STEP_FINAL["content"])
+        self.assertEqual(state["plan"]["status"], "completed")
+        self.assertEqual(
+            state["plan"]["budget"]["llm_steps"],
+            DEFAULT_MAX_TASK_LLM_STEPS + 1,
+        )
+        decide_step.assert_called_once()
 
     def test_executor_stops_before_exceeding_tool_budget(self):
         state = create_state("Find evidence")
@@ -692,6 +726,58 @@ class RuntimePlanningTests(unittest.TestCase):
             [None, "the paper search produced no usable candidate", None],
         )
         self.assertIn("任务计划已修订", str(state["messages"]))
+
+    def test_replan_starts_a_new_bounded_search_phase(self):
+        def search_call(call_id, query):
+            return {
+                "type": "tool_call",
+                "content": None,
+                "tool_call_id": call_id,
+                "tool_name": "search_paper",
+                "tool_arguments": {"query": query},
+            }
+
+        state = create_state("Find two papers and recover failed sources")
+        state["task_id"] = "task-existing"
+        state["plan"] = create_plan(
+            "task-existing",
+            "Find two papers and recover failed sources",
+            ["Find both papers", "Old comparison step"],
+        )
+        decisions = Mock(
+            side_effect=[
+                search_call("search-1", "first paper"),
+                search_call("search-2", "second paper"),
+                REPLAN_ACTION,
+                search_call("search-3", "arxiv:1706.03762"),
+                search_call("search-4", "arxiv:1810.04805"),
+                STEP_FINAL,
+            ]
+        )
+        search = Mock(
+            side_effect=[
+                SUCCESS_SEARCH_RESULT,
+                NO_SEARCH_RESULT,
+                SUCCESS_SEARCH_RESULT,
+                SUCCESS_SEARCH_RESULT,
+            ]
+        )
+
+        with (
+            patch("runtime.decide_plan_step", decisions),
+            patch.dict(
+                "runtime.TOOL_REGISTRY",
+                {"search_paper": search},
+                clear=True,
+            ),
+        ):
+            answer = run_agent(state, max_steps=6)
+
+        self.assertEqual(answer, STEP_FINAL["content"])
+        self.assertEqual(state["plan"]["status"], "completed")
+        self.assertEqual(state["plan"]["revision"], 2)
+        self.assertEqual(search.call_count, 4)
+        self.assertNotIn("search_limit_reached", str(state["messages"]))
 
     def test_replan_failure_signal_survives_a_turn_step_pause(self):
         state = create_state("Find evidence")

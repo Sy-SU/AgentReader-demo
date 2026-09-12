@@ -8,13 +8,100 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from checkpoint import save_checkpoint
-from main import main as run_cli
-from planning import create_plan
+from main import (
+    THINKING_MAX_STEPS_PER_TURN,
+    THINKING_MAX_TASK_LLM_STEPS,
+    main as run_cli,
+    parse_args,
+)
+from planning import create_plan, start_next_step
 from state import create_state
 from terminal import TerminalUI, parse_slash_command
 
 
 class TerminalUITests(unittest.TestCase):
+    def test_thinking_argument_is_explicit(self):
+        with patch("sys.argv", ["main.py", "--thinking"]):
+            arguments = parse_args()
+
+        self.assertTrue(arguments.thinking)
+
+    def test_thinking_mode_forces_reasoning_and_raises_turn_limit(self):
+        inputs = iter(["复杂任务", "/exit"])
+        output = StringIO()
+        terminal = TerminalUI(
+            plain=True,
+            input_func=lambda prompt: next(inputs),
+            output=output,
+        )
+        observed = {}
+
+        def fake_run_agent(
+            state,
+            max_steps=None,
+            max_task_llm_steps=None,
+            confirm_save=None,
+            on_event=None,
+            checkpoint_file=None,
+        ):
+            observed["max_steps"] = max_steps
+            observed["max_task_llm_steps"] = max_task_llm_steps
+            observed["thinking"] = os.getenv("LLM_THINKING")
+            return "完成。"
+
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "active.json"
+            with (
+                patch.dict(
+                    os.environ,
+                    {"LLM_THINKING": "disabled"},
+                    clear=False,
+                ),
+                patch("main.run_agent", side_effect=fake_run_agent),
+            ):
+                run_cli(
+                    ui=terminal,
+                    thinking=True,
+                    checkpoint_file=checkpoint,
+                )
+
+        self.assertEqual(
+            observed,
+            {
+                "max_steps": THINKING_MAX_STEPS_PER_TURN,
+                "max_task_llm_steps": THINKING_MAX_TASK_LLM_STEPS,
+                "thinking": "enabled",
+            },
+        )
+        self.assertEqual(THINKING_MAX_STEPS_PER_TURN, 100)
+        self.assertEqual(THINKING_MAX_TASK_LLM_STEPS, 100)
+        self.assertIn("Thinking 模式已开启", output.getvalue())
+        self.assertIn("max_steps=100", output.getvalue())
+
+    def test_checkpoint_summary_distinguishes_current_and_next_steps(self):
+        output = StringIO()
+        terminal = TerminalUI(plain=True, output=output)
+        state = create_state("比较两篇论文")
+        state["task_id"] = "task-summary"
+        state["plan"] = create_plan(
+            state["task_id"],
+            "比较两篇论文",
+            ["搜索第一篇论文", "搜索第二篇论文"],
+        )
+
+        terminal.print_checkpoint_restored(state, "active.json")
+        not_started = output.getvalue()
+        self.assertIn("当前步骤：尚未启动", not_started)
+        self.assertIn("下一步骤：搜索第一篇论文", not_started)
+
+        output.seek(0)
+        output.truncate(0)
+        state["plan"] = start_next_step(state["plan"])
+        terminal.print_checkpoint_restored(state, "active.json")
+        started = output.getvalue()
+        self.assertIn("当前步骤：搜索第一篇论文", started)
+        self.assertIn("下一步骤：搜索第二篇论文", started)
+
     def test_parse_slash_command_keeps_normal_messages_separate(self):
         self.assertIsNone(parse_slash_command("请搜索一篇论文"))
         self.assertEqual(parse_slash_command(" /HELP "), ("/help", ""))
@@ -356,6 +443,8 @@ class TerminalUITests(unittest.TestCase):
             )
             rendered = output.getvalue()
             self.assertIn("已恢复计划任务", rendered)
+            self.assertIn("当前步骤：尚未启动", rendered)
+            self.assertIn("下一步骤：搜索论文", rendered)
             self.assertIn("任务继续执行", rendered)
 
     def test_clear_cannot_discard_a_resumed_active_task(self):
@@ -418,6 +507,8 @@ class TerminalUITests(unittest.TestCase):
             self.assertIn("当前任务计划", rendered)
             self.assertIn("状态：running", rendered)
             self.assertIn("Revision：1", rendered)
+            self.assertIn("当前步骤：尚未启动", rendered)
+            self.assertIn("下一步骤：step-001 · 搜索第一篇论文", rendered)
             self.assertIn("[pending] 搜索第一篇论文", rendered)
             self.assertNotIn("G" * 201, rendered)
             self.assertTrue(path.exists())

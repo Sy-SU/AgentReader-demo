@@ -24,7 +24,8 @@ LLM 决策 -> Runtime 执行 Tool -> Tool Result 写回 State -> LLM 再决策
 - V2.1 已实现懒加载的本地全文 JSON 索引；PDF 未变化时重复检索会复用索引。
 - Runtime 已阻止同一用户轮次内重复执行相同的搜索 query。
 - 搜索源最多取 10 个候选，本地词法重排后仍只向模型返回前 3 个。
-- 搜索结果会显式标记相关性状态；每个用户轮次最多执行 2 次不同搜索。
+- 搜索结果会显式标记相关性状态；每个有界搜索阶段最多执行 2 次
+  不同搜索。
 - 已提供轻量交互式终端：实时显示 LLM/Tool 状态，支持输入历史、Slash Commands
   和无 ANSI 的 `--plain` 模式。
 - V2 已通过真实 arXiv、DeepSeek 和 PDF 的端到端验收，V2.0.1 的提取正确性与
@@ -47,9 +48,12 @@ Tool Calling 和框架无关；长期 Memory、Multi-Agent、LangGraph、MCP、�
 可信 Plan，并把首次规划调用计入任务预算；不会把 `submit_plan` 当作 Tool 执行。
 创建后先显示 Plan，下一条用户消息会启动第一个 pending step。`executor.py` 只向
 模型注入当前 step；Tool Result 先成为 Runtime 生成的可信 evidence reference，只有
-step-level final 才完成该 step。任务累计最多 32 次 LLM 决策和 24 次 Tool 执行。
+step-level final 才完成该 step。普通模式的任务累计最多 32 次 LLM 决策，
+Thinking 模式最多 100 次；Tool 仍最多执行 24 次。
 单个用户轮次默认最多进行 20 次 LLM 决策；如果活动 Plan 到达这个上限，Runtime
 保留计划进度并提示输入“继续”，而不是把整项任务标记为失败。
+启动时使用 `--thinking` 会显式强制 Provider thinking，并把单轮上限和
+任务累计 LLM 决策上限都提高到 100。
 
 Runtime 只会在 Tool 失败、搜索候选歧义、检索证据不足等可信观察出现后，临时向
 Executor 开放内部 `submit_plan`。每个任务最多 Replan 2 次；旧的 completed/failed
@@ -144,10 +148,26 @@ python main.py
 python main.py --resume
 ```
 
+复杂任务可以显式启用 Thinking 模式：
+
+```bash
+python main.py --thinking
+```
+
+该参数把进程内通用配置 `LLM_THINKING` 强制设为 `enabled`，并将每个用户轮次的
+`max_steps` 从 20 提高到 100，同时将 Plan 的任务级 LLM 决策上限从 32
+提高到 100。Tool 执行上限 24 和 Replan 上限 2 保持不变，且不会显示
+reasoning 内容。若 Thinking 任务退出后需要恢复，应继续显式使用：
+
+```bash
+python main.py --thinking --resume
+```
+
 不带 `--resume` 启动时若发现活动 Checkpoint，程序会在读取新任务前退出，避免覆盖
-旧任务。恢复成功后只显示目标、状态、revision 和当前步骤；不会打印历史消息或
-reasoning。输入“继续”执行 running 任务；blocked 任务应直接补充 Agent 请求的
-信息。`/exit` 会保留任务，任务完成后自动清除 Checkpoint。
+旧任务。恢复成功后只显示目标、状态、revision、实际当前步骤和下一 pending 步骤；
+尚未启动时明确显示“当前步骤：尚未启动”，不会把下一步误标为正在执行，也不会
+打印历史消息或 reasoning。输入“继续”执行 running 任务；blocked 任务应直接补充
+Agent 请求的信息。`/exit` 会保留任务，任务完成后自动清除 Checkpoint。
 
 程序会在每次 Agent 回答后继续等待输入，并把新消息追加到同一个 State。
 例如 Agent 发现多个 TASA 候选后，可以直接回复 `第 1 篇`。交互终端使用
@@ -253,7 +273,7 @@ RUN_LIVE_ARXIV_TESTS=1 RUN_LIVE_LLM_TESTS=1 \
 正式 Executor 分别搜索 arXiv:1706.03762 与 arXiv:1810.04805、下载两份真实 PDF、
 检索两边的页码证据并生成比较。固定计划用于降低模型规划措辞的偶然性；Executor、
 Provider、网络、PDF 索引和证据校验均为真实生产路径。2026-09-13 的完整验收为
-202 项测试全部通过、0 跳过。
+207 项测试全部通过、0 跳过。
 
 环境变量开关仍然保留，使普通离线开发或没有 API Key 的 CI 不会意外访问网络和
 产生模型费用；Codex 后续进行完整验收时使用上面的联网命令。
@@ -291,14 +311,16 @@ Agent 不应把候选说成相关；如果现有线索足够，可以生成一�
 调用 `search_paper`。每个 LLM step 仍只执行一个 Tool Call；Provider 如果
 同时建议多个调用，系统会先执行第一个并观察结果，再进行下一次决策。
 
-`run_agent()` 会记录当前用户轮次里已经尝试过的有效搜索 query。比较前采用与
+`run_agent()` 会记录当前有界搜索阶段里已经尝试过的有效 query。比较前采用与
 搜索 Tool 相同的空白规范化，因此 `TASA   scene` 和 `TASA scene` 会被视为重复；
 第二次调用不会访问 arXiv 或 Crossref，而是产生
 `duplicate_search_query` 结构化错误供模型观察。新的用户消息会启动新的
 `run_agent()` 调用并清空这份临时集合，所以用户主动要求重新搜索相同 query
-仍然允许。不同的精炼 query 不受重复检查影响，但每个用户轮次最多尝试 2 个
-不同 query；第三个返回 `search_limit_reached`，不会访问网络。这里的“重搜”仍是
-LLM 根据结果作出的下一步 Tool Call，不是 Runtime 自己生成搜索词。
+仍然允许。每次 `run_agent()` 开始一个新的搜索阶段，最多尝试 2 个不同
+query。如果 Runtime 在该轮内接受了由可信失败触发的 Replan，则为新
+revision 开始一个新的 2 次搜索阶段。同一阶段的第三个
+不同 query 仍返回 `search_limit_reached`，不会访问网络。这里的“重搜”仍是 LLM
+根据结果作出的下一步 Tool Call，不是 Runtime 自己生成搜索词。
 
 ## Tool 目录
 

@@ -34,10 +34,12 @@ runtime.py 启动循环
 
 ### `main.py`
 
-- 解析 `--debug`、`--plain` 和 `--resume`。
+- 解析 `--debug`、`--plain`、`--resume` 和 `--thinking`。
 - 组合 Terminal、State 和 Runtime，但不包含具体显示实现。
 - 启动时检测唯一活动 Checkpoint；普通启动拒绝覆盖，`--resume` 校验后恢复 State。
 - 第一轮创建 State，后续轮次向同一个 State 追加用户消息。
+- `--thinking` 在进程内强制 `LLM_THINKING=enabled`，并在调用 Runtime 时把单轮
+  `max_steps` 和任务级 `max_task_llm_steps` 都设为 100。
 - 处理 `/help`、`/debug`、`/clear`、`/plan`、`/cancel`、`/exit`；这些命令不会
   写入 State。
 - 空输入重新提示；`/exit`、`exit`、`quit`、`退出` 或 EOF 结束会话。
@@ -54,6 +56,8 @@ runtime.py 启动循环
 - 有界显示 Checkpoint 冲突、恢复摘要和校验错误，不显示消息历史或 reasoning。
 - 有界显示 Runtime-owned Plan，并渲染计划创建、步骤转换、Replan、阻塞、取消和
   Checkpoint 保存事件。
+- 恢复摘要和 `/plan` 分别显示实际 current step 与下一 pending step；
+  `current_step_id=None` 时明确表示尚未启动。
 - 只负责输入与显示，不执行 Tool，也不决定授权策略。
 
 ### `events.py`
@@ -107,8 +111,9 @@ Runtime 只保存 `llm.py` 已归一化的不透明协议字段。
 - 将 `extract_paper_text` 的 `paper_id` 解析为历史下载结果中的可信缓存路径。
 - 将 `retrieve_paper_chunks` 的 `paper_id` 解析为历史下载结果；只允许模型补充
   query 和有界 `top_k`，不接受本地路径。
-- 在每次 `run_agent()` 调用中维护本轮搜索 query 集合，阻止相同有效 query 再次
-  到达搜索 Tool，并把不同 query 的数量限制为 2；下一用户轮次重新创建集合。
+- 在每个有界搜索阶段维护 query 集合，阻止相同有效 query 再次到达搜索
+  Tool，并把不同 query 的数量限制为 2；普通任务下一用户轮次重置，Plan
+  任务在可信 Replan 成功后为新 revision 重置。
 - 执行 Tool，并将结果或结构化错误写回 State。
 - 将每次归一化模型响应的 reasoning 元数据附着到对应 Assistant State 消息，使
   `llm.py` 能在下次请求中恢复完整的 thinking Tool Calling 历史。
@@ -126,6 +131,12 @@ Runtime 是执行和约束层。它限制保存、下载和提取操作只能引
 Tool Result，并强制保存操作必须经过人工确认。`terminal.py` 负责具体终端交互，
 `main.py` 负责组合各层，Runtime 负责执行确认和来源校验策略；具体 Tool 不读取
 用户输入。
+
+CLI Thinking 模式不新增 Runtime 状态，也不改变 Provider Adapter：`main.py` 通过
+现有通用环境配置显式开启 reasoning，并向 `run_agent()` 传入 100 次单轮上限
+与 100 次任务级上限。普通模式仍使用 20/32；Plan 数据契约允许计数器最多到
+100，而 Runtime 根据启动模式选择实际上限。
+Thinking 是否跨进程继续由启动参数决定；恢复时应再次使用 `--thinking --resume`。
 
 ### `checkpoint.py`
 
@@ -717,7 +728,7 @@ LLM 返回候选和澄清问题 → terminal.py 输出本轮回答并继续读�
 → 新结果写回 State → LLM 再判断
 ```
 
-同一用户轮次里模型再次提交相同 query 时：
+同一有界搜索阶段里模型再次提交相同 query 时：
 
 ```text
 LLM 再次调用 search_paper("TASA scene")
@@ -727,14 +738,14 @@ LLM 再次调用 search_paper("TASA scene")
 → LLM 改写 query 或返回澄清问题
 ```
 
-临时集合属于一次 `run_agent()` 调用，而不是长期 State。用户发送下一条消息后，
-新的 `run_agent()` 会建立空集合，因此用户主动要求重新执行相同搜索仍然允许。
+临时集合不进入长期 State。简单任务在新 `run_agent()` 开始时建立空集合；
+Plan 任务在 Runtime 接受可信 Replan 后也会清空它，使新 revision 能够恢复搜索。
 
-如果模型在同一用户轮次提交第三个不同 query：
+如果模型在同一搜索阶段提交第三个不同 query：
 
 ```text
 LLM 第三次调用 search_paper("another query")
-→ Runtime 发现本轮已经尝试 2 个不同 query
+→ Runtime 发现本阶段已经尝试 2 个不同 query
 → 不执行搜索 Tool，不访问网络
 → search_limit_reached 写回 State
 → LLM 停止搜索并请求用户澄清
@@ -791,9 +802,9 @@ Runtime 只计数和拒绝，不生成第二个 query。是否根据 `no_lexical
 ## 8. 错误模型
 
 - 没有搜索结果：正常 Tool Result，`found=false`。
-- 同一用户轮次重复相同搜索：Runtime 返回 `duplicate_search_query`，不访问网络。
-- 同一用户轮次提交第三个不同搜索：Runtime 返回 `search_limit_reached`，不访问
-  网络。
+- 同一搜索阶段重复相同搜索：Runtime 返回 `duplicate_search_query`，不访问网络。
+- 同一搜索阶段提交第三个不同搜索：Runtime 返回 `search_limit_reached`，不访问
+  网络。Plan 的 Replan 成功后才开始新阶段。
 - 未知工具、参数不匹配：Runtime 返回结构化错误。
 - 保存 ID 不在当前任务搜索历史中：Runtime 返回 `unknown_candidate`，不写文件。
 - 保存调用没有确认器：Runtime 返回 `approval_required`，不写文件。
@@ -1068,3 +1079,9 @@ DeepSeek 通过正式 Executor 决策，并真实搜索 arXiv:1706.03762 与 arX
 下载两份 PDF、建立全文索引、取得两边带页码的片段并生成比较。测试还校验两篇的
 可信 ID、下载结果、页码与文本证据以及最终回答的双论文页码引用。2026-09-13 的
 全量联网结果为 202 项通过、0 跳过。
+
+提交后的终端复盘增加 `--thinking` 以及 current/next step 显示测试后，最新全量
+联网结果为 205 项通过、0 跳过。
+
+Thinking 上限提高到 100 并修复 Replan 恢复搜索额度后，最新全量联网结果为
+207 项通过、0 跳过。

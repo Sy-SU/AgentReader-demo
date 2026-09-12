@@ -604,8 +604,8 @@ V3 真实使用结果选择一个明确问题，再评估 Context 压缩、检�
   路径、论文 ID 或 evidence reference。
 - **Replan 边界**：只在 Tool 失败、候选歧义、证据不足或前提失效时触发；最多 2
   次，且必须保留完成步骤和可信证据，不重复副作用。
-- **任务预算**：累计最多 32 次 LLM 决策和 24 次 Tool 执行；达到上限后进入明确的
-  `blocked` 或 `failed`，不能无限循环。
+- **任务预算**：普通模式累计最多 32 次 LLM 决策，Thinking 模式最多
+  100 次；Tool 仍最多执行 24 次。达到上限后进入明确的 `blocked` 或 `failed`。
 - **恢复边界**：第一版同一进程只有一个活动任务，Checkpoint 默认上限 4 MiB；
   `--resume` 只恢复同一任务。完成、不可恢复失败或取消后清除活动 Checkpoint；新
   任务不能静默覆盖尚未恢复的活动文件。
@@ -692,6 +692,24 @@ V3 真实使用结果选择一个明确问题，再评估 Context 压缩、检�
 - **真实系统验收结果**：测试用受控四步 Plan 降低规划输出随机性，Executor 与
   DeepSeek、arXiv:1706.03762、arXiv:1810.04805、双 PDF 下载、全文索引、页码证据和
   最终比较均走真实路径。2026-09-13 全量联网 202 项全部通过、无跳过。
+- **交互复盘发现**：真实执行“创建 Plan → 退出 → 拒绝覆盖 → 恢复 → 取消”时，
+  State 和 Checkpoint 均正确，但恢复摘要把第一条 pending step 标成了“当前步骤”，
+  而 `/plan` 根据 `current_step_id=None` 显示尚未开始。根因是两个 UI 入口使用了
+  不同的展示推导；修复后都分别显示实际 current 和下一 pending step，并补回归测试。
+- **Thinking 模式决策**：Provider reasoning、单轮 `max_steps` 和任务级预算是三个
+  独立控制。`--thinking` 通过 `LLM_THINKING` 显式开启推理，同时把后两者都提高
+  到 100。普通模式仍使用 20/32，Tool 24 次与 Replan 2 次边界不变，因此仍然
+  不能无限循环。跨进程恢复时需再次传入 `--thinking --resume`。
+- **Replan 搜索额度修正**：一次真实任务中，arXiv 429/超时使两次初始搜索
+  回退 Crossref，Crossref 候选又没有 PDF URL。下载失败触发 Replan 后，原先按
+  `run_agent()` 整轮计数的 2 次搜索额度阻止了新 revision 的 arXiv ID 定向恢复。
+  Runtime 现改为每个有界搜索阶段最多 2 次，可信 Replan 被接受后在同一
+  用户轮内为新 revision 开始新阶段；
+  每任务最多 2 次 Replan，所以恢复能力仍然有界。
+- **联网测试修正**：全量复测首次遇到一次真实系统任务进入可恢复 `blocked`，单独
+  重跑通过，说明这是外部网络或模型决策的非确定性，而不是 CLI 回归。系统用例改为
+  在最多 3 个执行轮次内按正式 blocked 恢复协议补充“信息已齐全、重试可信 ID”，
+  连续不能恢复仍失败，且最终双论文、双 PDF、页码证据断言不放宽。
 - **下一小步**：提交 V3 工作后进行一次版本复盘；只有从真实使用或评测中识别出
   明确瓶颈，再与用户共同定义下一版本需求。
 
@@ -699,6 +717,8 @@ V3 真实使用结果选择一个明确问题，再评估 Context 压缩、检�
 
 | 日期 | 阶段 | 更新内容 | 证据 |
 |---|---|---|---|
+| 2026-09-13 | V3 Thinking/恢复搜索修正 | Thinking 单轮与任务级 LLM 上限提高到 100；Replan 开启新的有界搜索阶段 | 新增高预算与 Replan 后两次恢复搜索回归；真实 arXiv + DeepSeek 全量 207 项通过、0 跳过 |
+| 2026-09-13 | V3 交互复盘修正 | current/next step 显示一致；新增 `--thinking`，单轮 30、任务级仍为 32；系统测试按协议有限恢复 blocked | 新增 3 项终端测试；真实 arXiv + DeepSeek 全量 205 项通过、无跳过 |
 | 2026-09-13 | V3 完成 | `/plan`、`/cancel`；计划生命周期事件；确定性 Planning 评测；真实双论文 PDF 验收 | 规划快照 completed=true、Replan=0、LLM=6、Tool=2、Checkpoint 最大 4,572 B；真实 arXiv + DeepSeek 全量 202 项通过、无跳过 |
 | 2026-09-13 | V3 Checkpoint/恢复 | 版本化原子快照；严格恢复校验；`--resume`；冲突保护；活动任务 `/clear` 保护 | 真实 arXiv + DeepSeek 全量 190 项通过、无跳过 |
 | 2026-09-13 | V3 Replan/blocked | 可信失败条件下有限重规划；保留历史/evidence；用户澄清阻塞恢复；重复副作用复用 | 新增 14 项测试；真实 arXiv + DeepSeek 全量 170 项通过、无跳过 |

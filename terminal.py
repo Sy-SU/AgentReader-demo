@@ -85,6 +85,12 @@ class TerminalUI:
             return
         self._write(f"AgentReader · {provider} · 输入 /help 查看命令")
 
+    def print_thinking_mode(self, max_steps: int) -> None:
+        self._write(
+            "Thinking 模式已开启 · Provider reasoning=enabled · "
+            f"单轮 max_steps={max_steps}"
+        )
+
     def read_input(self) -> str:
         if self._session is not None:
             return self._session.prompt([("class:prompt", "You › ")])
@@ -298,11 +304,29 @@ class TerminalUI:
             ),
             None,
         )
+        next_step = next(
+            (
+                step
+                for step in plan.get("steps", [])
+                if step.get("status") == "pending"
+            ),
+            None,
+        )
         current_summary = (
             f"{current_step_id} · "
             f"{_shorten(current_step['description'], 160)}"
             if current_step is not None
-            else "尚未开始或已经结束"
+            else (
+                "尚未启动"
+                if next_step is not None
+                else "已经结束"
+            )
+        )
+        next_summary = (
+            f"{next_step.get('id')} · "
+            f"{_shorten(str(next_step.get('description', '')), 160)}"
+            if next_step is not None
+            else "无"
         )
         lines = [
             "\n当前任务计划：",
@@ -310,6 +334,7 @@ class TerminalUI:
             f"  状态：{plan.get('status', 'unknown')}",
             f"  Revision：{plan.get('revision', 'unknown')}",
             f"  当前步骤：{current_summary}",
+            f"  下一步骤：{next_summary}",
             "  步骤：",
         ]
         for index, step in enumerate(plan.get("steps", [])[:8], start=1):
@@ -379,19 +404,23 @@ class TerminalUI:
             ),
             None,
         )
-        if current_step is None:
-            current_step = next(
-                (
-                    step
-                    for step in plan["steps"]
-                    if step["status"] == "pending"
-                ),
-                None,
-            )
+        next_step = next(
+            (
+                step
+                for step in plan["steps"]
+                if step["status"] == "pending"
+            ),
+            None,
+        )
         current_summary = (
             _shorten(current_step["description"], 160)
             if current_step is not None
-            else "等待 Runtime 确认下一步"
+            else "尚未启动"
+        )
+        next_summary = (
+            _shorten(next_step["description"], 160)
+            if next_step is not None
+            else "无"
         )
         self._write(
             "已恢复计划任务：\n"
@@ -399,6 +428,7 @@ class TerminalUI:
             f"  状态：{plan['status']}\n"
             f"  Revision：{plan['revision']}\n"
             f"  当前步骤：{current_summary}\n"
+            f"  下一步骤：{next_summary}\n"
             f"  Checkpoint：{path}\n"
             "请补充阻塞信息，或输入“继续”执行。"
         )

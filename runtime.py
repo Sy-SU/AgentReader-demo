@@ -47,8 +47,9 @@ TOOL_REGISTRY = {
     "extract_paper_text": extract_paper_text,
     "retrieve_paper_chunks": retrieve_paper_chunks,
 }
-MAX_SEARCH_ATTEMPTS_PER_TURN = 2
+MAX_SEARCH_ATTEMPTS_PER_PHASE = 2
 DEFAULT_MAX_STEPS_PER_TURN = 20
+DEFAULT_MAX_TASK_LLM_STEPS = 32
 SIDE_EFFECT_TOOLS = frozenset({"save_paper", "download_paper"})
 
 
@@ -402,8 +403,18 @@ def run_agent(
     confirm_save: Callable[[dict], bool] | None = None,
     on_event: EventHandler | None = None,
     checkpoint_file: str | Path | None = None,
+    max_task_llm_steps: int = DEFAULT_MAX_TASK_LLM_STEPS,
 ) -> str:
     """Run one conversational turn until a final answer or the step limit."""
+    if (
+        isinstance(max_task_llm_steps, bool)
+        or not isinstance(max_task_llm_steps, int)
+        or not 1 <= max_task_llm_steps <= MAX_TASK_LLM_STEPS
+    ):
+        raise ValueError(
+            "max_task_llm_steps must be an integer between 1 and "
+            f"{MAX_TASK_LLM_STEPS}."
+        )
     active_plan = _active_plan(state)
     if active_plan is not None and active_plan["status"] == "blocked":
         if _latest_message_role(state) == "user":
@@ -446,18 +457,18 @@ def run_agent(
     plan_execution = active_plan is not None
 
     steps_this_turn = 0
-    search_queries_this_turn = set()
+    search_queries_in_phase = set()
 
     while steps_this_turn < max_steps:
         if (
             plan_execution
             and state["plan"]["budget"]["llm_steps"]
-            >= MAX_TASK_LLM_STEPS
+            >= max_task_llm_steps
         ):
             return _finish_plan_at_budget_limit(
                 state,
                 budget_name="LLM 决策",
-                limit=MAX_TASK_LLM_STEPS,
+                limit=max_task_llm_steps,
                 turn_step=steps_this_turn,
                 on_event=on_event,
                 checkpoint_file=checkpoint_file,
@@ -628,6 +639,10 @@ def run_agent(
                 failed,
                 response["step_descriptions"],
             )
+            # A trusted Replan starts a new bounded search phase. Without
+            # resetting here, two failed searches in the previous revision
+            # make the revised plan unable to perform its recovery search.
+            search_queries_in_phase.clear()
             state["messages"].append(
                 _assistant_message(
                     response,
@@ -840,7 +855,12 @@ def run_agent(
                 observation = _search_guard_result(
                     tool_name,
                     tool_arguments,
-                    search_queries_this_turn,
+                    search_queries_in_phase,
+                    plan_revision=(
+                        state["plan"]["revision"]
+                        if plan_execution
+                        else None
+                    ),
                 )
             if observation is None:
                 observation = execute_tool(
@@ -1355,9 +1375,11 @@ def _emit_event(
 def _search_guard_result(
     tool_name: str,
     arguments: object,
-    search_queries_this_turn: set[str],
+    search_queries_in_phase: set[str],
+    *,
+    plan_revision: int | None = None,
 ) -> dict | None:
-    """Reject duplicate or excessive searches within one user turn."""
+    """Reject duplicate or excessive searches in one bounded search phase."""
     if tool_name != "search_paper" or not isinstance(arguments, dict):
         return None
     if set(arguments) != {"query"}:
@@ -1370,33 +1392,39 @@ def _search_guard_result(
     if not normalized_query:
         return None
 
-    if normalized_query in search_queries_this_turn:
+    scope = (
+        f"current search phase (plan revision {plan_revision})"
+        if plan_revision is not None
+        else "current user turn"
+    )
+
+    if normalized_query in search_queries_in_phase:
         return {
             "error": {
                 "type": "duplicate_search_query",
                 "message": (
                     f"Search query '{normalized_query}' was already "
-                    "attempted in the current user turn. Use a refined "
+                    f"attempted in the {scope}. Use a refined "
                     "query or return a final answer."
                 ),
             }
         }
 
-    if len(search_queries_this_turn) >= MAX_SEARCH_ATTEMPTS_PER_TURN:
+    if len(search_queries_in_phase) >= MAX_SEARCH_ATTEMPTS_PER_PHASE:
         return {
             "error": {
                 "type": "search_limit_reached",
                 "message": (
-                    "The current user turn already attempted "
-                    f"{MAX_SEARCH_ATTEMPTS_PER_TURN} different search "
+                    f"The {scope} already attempted "
+                    f"{MAX_SEARCH_ATTEMPTS_PER_PHASE} different search "
                     "queries. Ask the user for clarification before "
                     "searching again."
                 ),
-                "limit": MAX_SEARCH_ATTEMPTS_PER_TURN,
+                "limit": MAX_SEARCH_ATTEMPTS_PER_PHASE,
             }
         }
 
-    search_queries_this_turn.add(normalized_query)
+    search_queries_in_phase.add(normalized_query)
     return None
 
 

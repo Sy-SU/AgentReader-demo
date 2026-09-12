@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 
 from checkpoint import (
@@ -7,6 +8,7 @@ from checkpoint import (
     checkpoint_path,
     load_checkpoint,
 )
+from planning import MAX_TASK_LLM_STEPS
 from runtime import cancel_active_task, run_agent
 from state import append_user_message, create_state
 from terminal import (
@@ -17,6 +19,10 @@ from terminal import (
     parse_slash_command,
     print_debug_trace,
 )
+
+
+THINKING_MAX_STEPS_PER_TURN = 100
+THINKING_MAX_TASK_LLM_STEPS = MAX_TASK_LLM_STEPS
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +44,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="validate and resume the active planning checkpoint",
     )
+    parser.add_argument(
+        "--thinking",
+        action="store_true",
+        help=(
+            "force provider thinking and allow up to "
+            f"{THINKING_MAX_STEPS_PER_TURN} LLM decisions per turn"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -45,12 +59,17 @@ def main(
     debug: bool = False,
     plain: bool = False,
     resume: bool = False,
+    thinking: bool = False,
     ui: TerminalUI | None = None,
     checkpoint_file: str | Path | None = None,
 ) -> None:
+    if thinking:
+        os.environ["LLM_THINKING"] = "enabled"
     terminal = ui or TerminalUI(debug=debug, plain=plain)
     active_checkpoint = checkpoint_path(checkpoint_file)
     terminal.print_banner()
+    if thinking:
+        terminal.print_thinking_mode(THINKING_MAX_STEPS_PER_TURN)
 
     if resume:
         try:
@@ -157,12 +176,17 @@ def main(
 
         terminal.begin_turn()
         try:
-            final_answer = run_agent(
-                state,
-                confirm_save=terminal.confirm_save,
-                on_event=terminal.handle_event,
-                checkpoint_file=active_checkpoint,
-            )
+            run_options = {
+                "confirm_save": terminal.confirm_save,
+                "on_event": terminal.handle_event,
+                "checkpoint_file": active_checkpoint,
+            }
+            if thinking:
+                run_options["max_steps"] = THINKING_MAX_STEPS_PER_TURN
+                run_options["max_task_llm_steps"] = (
+                    THINKING_MAX_TASK_LLM_STEPS
+                )
+            final_answer = run_agent(state, **run_options)
         except (RuntimeError, ValueError) as error:
             terminal.report_unhandled_error(error)
             if not terminal.interactive:
@@ -198,4 +222,5 @@ if __name__ == "__main__":
         debug=arguments.debug,
         plain=arguments.plain,
         resume=arguments.resume,
+        thinking=arguments.thinking,
     )

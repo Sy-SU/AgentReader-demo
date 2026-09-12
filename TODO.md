@@ -232,7 +232,7 @@ save_paper 写入本地文献库
 - [x] 返回词法得分、命中位置和原始来源排名，最终仍只向模型返回前 3 个。
 - [x] 精确标题命中优先于只包含完整标题短语的扩展标题。
 - [x] 用四种状态表达最低相关性信号，不把无词法匹配伪装成相关结果。
-- [x] 每个用户轮次最多执行 2 次不同搜索，第三次返回结构化错误。
+- [x] 每个有界搜索阶段最多执行 2 次不同搜索，第三次返回结构化错误。
 - [x] 搜索 Debug Trace 使用有界摘要预览，不让长结果遮住最终回答和下一轮提示。
 
 ### Step 6：V2 端到端验收（已完成）
@@ -311,8 +311,8 @@ Context 原则。
 - [x] Runtime 启动第一个 pending step，将当前目标注入模型 Context；模型返回
   step-level final 后才完成该 step，而不是把任意一次 Tool 成功直接当作完成。
 - [x] Tool 失败、候选歧义或检索证据不足时才允许 Replan；普通成功步骤不重复规划。
-- [x] Runtime 记录任务级 LLM/Tool 用量，并在执行前阻止超过 32 次 LLM 决策或
-  24 次 Tool 执行。
+- [x] Runtime 记录任务级 LLM/Tool 用量；普通模式阻止超过 32 次 LLM
+  决策，Thinking 模式阻止超过 100 次，Tool 仍最多执行 24 次。
 - [x] 每个任务最多 Replan 2 次。
 - [x] Replan 必须保留已完成步骤、可信结果和证据，不能重复有副作用的操作。
 - [x] 缺少关键用户选择时进入 `blocked` 并请求澄清，不得由模型擅自补全。
@@ -326,7 +326,8 @@ evidence，只替换 pending 后缀，并增加 revision 和 Replan 预算。内
 `request_clarification` 会阻塞当前步骤，用户补充信息后原步骤恢复并增加 attempts。
 重规划后的重复保存或下载复用先前可信 Tool Result，不再次执行副作用。达到单轮
 `max_steps` 时失败信号与活动 Plan 都会保留，后续输入“继续”仍可完成 Replan。
-任务级 32/24/2 预算保持不变。本阶段新增 14 项 Plan、Executor 与 Runtime 测试；
+默认任务级预算为 32/24/2；Thinking 模式的 LLM 决策预算为 100，后两项
+保持 24/2。本阶段新增 14 项 Plan、Executor 与 Runtime 测试；
 真实 arXiv + DeepSeek 全量 170 项通过，无跳过。Checkpoint 与恢复现已在 Step 3
 完成。
 
@@ -408,6 +409,20 @@ blocked、cancelled 和 Checkpoint 保存均通过深拷贝 Runtime Event 暴露
 Checkpoint 保存 13 次、最大 4,572 B。真实系统测试使用受控四步计划降低 Planner
 随机性，其余 DeepSeek Executor、arXiv、两份 PDF、全文索引和页码证据链均走正式
 路径。2026-09-13 全量联网测试 202 项全部通过、无跳过。
+
+### V3 提交后交互复盘修正
+
+- [x] 修复恢复摘要把第一条 pending step 误标为“当前步骤”的显示问题。
+- [x] `/plan` 与 `--resume` 同时区分实际 current step 和下一 pending step。
+- [x] 增加 CLI `--thinking` 模式，显式强制 Provider thinking，并在终端显示模式。
+- [x] Thinking 模式将单轮 `max_steps` 和任务级 LLM 决策上限都提高到
+  100；普通模式仍为单轮 20、任务级 32。
+- [x] Replan 成功后为新 plan revision 重置 2 次搜索额度，避免恢复搜索被
+  上一 revision 的失败尝试阻断。
+- [x] 为参数解析、Provider 配置、单轮上限和恢复摘要增加回归测试。
+
+最新全量联网回归为 207 项通过、0 跳过，包含真实 arXiv、DeepSeek
+thinking 和双 PDF 系统用例。
 
 ### V3 明确非目标
 

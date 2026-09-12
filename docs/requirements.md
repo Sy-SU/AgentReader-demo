@@ -45,6 +45,10 @@ Agent = LLM + Tools + Loop + State
   和耗时，不需要等待整轮完成。
 - `python main.py --plain` 禁用颜色、Spinner 和增强输入；非 TTY 自动使用 Plain
   模式，输出不得含 ANSI 控制符，运行失败时必须返回非零退出码。
+- `python main.py --thinking` 必须显式强制当前进程的 Provider thinking，将单轮
+  LLM 决策上限和任务级 LLM 预算都提高到 100，并在终端显示模式。
+- 恢复 Thinking 任务时由用户再次传入 `--thinking --resume`；Checkpoint 继续保存
+  Provider 协议所需的 reasoning 字段，但不把 CLI 模式当作长期配置。
 - 搜索 Tool Result 的调试显示必须把每篇摘要限制为最多 400 字符的
   `abstract_preview`；完整摘要仍保留在 State 中，显示裁剪不得改变模型 Context。
 
@@ -250,14 +254,16 @@ pdf_url
 - `max_steps` 必须在模型不能结束时终止当前轮；默认值为 20，每次用户新输入后重新
   计数。活动 Plan 到达该上限时必须保留 Plan，并明确提示用户可输入“继续”；不得
   把本轮暂停误报为整个任务失败。
-- Runtime 必须在每次 `run_agent()` 调用中记录已经尝试的有效搜索 query；比较前
+- Runtime 必须在当前有界搜索阶段中记录已经尝试的有效搜索 query；比较前
   折叠首尾及连续空白，与 `search_paper` 的规范化一致。
-- 同一用户轮次的重复 query 必须返回 `duplicate_search_query` 结构化错误，不得
+- 同一搜索阶段的重复 query 必须返回 `duplicate_search_query` 结构化错误，不得
   再次调用搜索 Tool。精炼后的不同 query 仍可执行。
-- 这份去重集合只属于当前 `run_agent()` 调用；下一条用户消息开始时必须重置，
-  以保留用户主动重新搜索同一 query 的能力。
-- 每次 `run_agent()` 最多允许 2 个不同的有效搜索 query。第三个不同 query 必须
-  返回 `search_limit_reached`，不得执行搜索 Tool；下一用户轮次重新计数。
+- 简单任务的去重集合只属于当前 `run_agent()` 调用；下一条用户消息开始时必须
+  重置，以保留用户主动重新搜索同一 query 的能力。
+- 每次 `run_agent()` 开始一个新的有界搜索阶段，最多允许 2 个不同的有效
+  query。第三个必须返回 `search_limit_reached`，不得执行搜索 Tool。
+- 只有可信失败触发的 Replan 被 Runtime 接受后，才能在同一用户轮内为新
+  revision 开始新的搜索阶段；普通 LLM 决策不得自行重置。
 - Runtime 不负责生成精炼 query；LLM 观察 Tool Result 后决定是否进行第二次搜索。
 
 ### FR-13：Runtime 事件与终端显示
@@ -337,8 +343,9 @@ Tool Call 与 final 不变，而且该内部契约不在 Tool Registry。当前 
   高层步骤；模型返回 step-level final 后才由 Runtime 完成当前步骤。模型不能直接
   伪造完成状态、计数器或 evidence reference。
 - 只有 Tool 失败、候选歧义、检索证据不足或计划前提不成立时才允许 Replan。
-- 每个任务最多 Replan 2 次、累计最多 32 次 LLM 决策和 24 次 Tool 执行；达到任一
-  上限后必须进入 `failed` 或 `blocked`，不能继续循环。
+- 每个任务最多 Replan 2 次、Tool 执行 24 次。普通模式累计最多 32 次 LLM
+  决策，Thinking 模式最多 100 次；达到当前模式的任一上限后必须进入
+  `failed` 或 `blocked`，不能继续循环。
 - Replan 必须保留已完成步骤和可信证据。已经成功完成或产生副作用的步骤不能仅因
   新计划而重复执行。
 - 缺少论文选择、写入许可等关键用户输入时，任务必须进入 `blocked` 并请求澄清。
@@ -362,8 +369,9 @@ completed/failed 步骤、attempts 和 evidence reference，删除旧 pending �
 
 `save_paper` 和 `download_paper` 的相同参数已经产生成功结果后，后续 Plan/Replan
 调用会复用可信旧 Tool Result，并标记 `runtime_reused=true`，不再次执行写入或下载。
-首次 `save_paper` 仍通过现有 Runtime 人工确认边界逐篇询问 `y/N`。任务总预算仍为
-32 次 LLM 决策、24 次 Tool 调用和 2 次 Replan。
+首次 `save_paper` 仍通过现有 Runtime 人工确认边界逐篇询问 `y/N`。普通模式任务预算为
+32 次 LLM 决策、24 次 Tool 调用和 2 次 Replan；Thinking 模式只将第一项
+提高到 100。
 
 DeepSeek thinking 多步协议也已接入：`llm.py` 提取每个 Assistant 响应的推理元数据，
 Planner 在内部化 `submit_plan` 时保留它，Runtime 将其附着到 Plan 预览、Tool Call
@@ -403,6 +411,8 @@ Plan evidence reference、稳定论文 ID 和已下载 PDF 缓存；任一校验
 
 - `/plan` 必须以有界形式显示目标、revision、任务状态、当前步骤和各步骤状态；
   `/cancel` 明确取消当前活动任务，并同步更新 `/help`。
+- 创建 Plan 后尚未启动步骤时，`/plan` 和 `--resume` 必须显示“当前步骤：尚未启动”，
+  并把第一条 pending step 单独标为“下一步骤”，不能把 pending 误称为 current。
 - 活动任务存在时，`/clear` 不得静默删除 Plan 或 Checkpoint；应提示先继续或取消。
 - 活动任务执行期间，普通用户消息只用于补充或澄清当前任务；开始无关任务前必须
   先完成或 `/cancel` 当前任务。
@@ -427,6 +437,9 @@ Replan=0、LLM 决策 6 次、Tool 执行 2 次、Checkpoint 保存 13 次、最
 真实系统用例以固定四步高层计划减少 Planner 随机性，但 DeepSeek Executor、arXiv
 搜索、两份 PDF 下载、全文索引、页码检索和最终比较均走正式路径。2026-09-13
 完整联网验收运行 202 项测试，202 项全部通过，没有跳过。
+
+提交后的交互复盘又增加 `--thinking` 和 current/next step 显示回归测试；最新一次
+完整联网验收运行 207 项测试，207 项全部通过，没有跳过。
 
 ## 4. 状态需求
 

@@ -15,7 +15,9 @@ PLAN_FORMAT_VERSION = 1
 MAX_PLAN_STEPS = 8
 MAX_PLAN_GOAL_CHARS = 2_000
 MAX_STEP_DESCRIPTION_CHARS = 500
-MAX_TASK_LLM_STEPS = 32
+# Absolute Plan-contract ceiling. Runtime may choose a lower mode-specific
+# limit, but persisted usage must remain valid up to Thinking mode's budget.
+MAX_TASK_LLM_STEPS = 100
 MAX_TASK_TOOL_CALLS = 24
 MAX_TASK_REPLANS = 2
 MAX_EVIDENCE_REFS_PER_STEP = 24

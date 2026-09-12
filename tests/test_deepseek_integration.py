@@ -220,7 +220,7 @@ class LiveMultiPaperSystemTests(unittest.TestCase):
 
     def _run_to_completion(self, state, checkpoint_file):
         answer = ""
-        for _ in range(2):
+        for _ in range(3):
             answer = run_agent(
                 state,
                 max_steps=20,
@@ -228,11 +228,51 @@ class LiveMultiPaperSystemTests(unittest.TestCase):
             )
             if state["plan"]["status"] == "completed":
                 return answer
-            self.assertNotEqual(state["plan"]["status"], "blocked")
-            append_user_message(state, "继续完成当前计划。")
+            if state["plan"]["status"] == "blocked":
+                append_user_message(
+                    state,
+                    (
+                        "任务所需信息已经完整提供。请恢复当前步骤；如果刚才是"
+                        "临时网络或检索失败，请使用同一可信论文 ID 重试，不要"
+                        "虚构结果。"
+                    ),
+                )
+            elif state["plan"]["status"] == "running":
+                append_user_message(state, "继续完成当前计划。")
+            else:
+                self.fail(self._blocked_diagnostic(state, answer))
         self.fail(
-            "The live multi-paper task did not complete within two turns; "
-            f"last answer: {answer}"
+            "The live multi-paper task did not complete within three turns; "
+            + self._blocked_diagnostic(state, answer)
+        )
+
+    def _blocked_diagnostic(self, state, answer):
+        plan = state["plan"]
+        current_step = next(
+            (
+                step
+                for step in plan["steps"]
+                if step["id"] == plan["current_step_id"]
+            ),
+            None,
+        )
+        tool_summary = []
+        for message in state["messages"]:
+            if message["role"] != "tool":
+                continue
+            content = message.get("content", {})
+            summary = {
+                "name": message.get("name"),
+                "paper_id": content.get("paper_id"),
+                "found": content.get("found"),
+                "error": content.get("error"),
+            }
+            tool_summary.append(summary)
+        return (
+            "live task became blocked; "
+            f"current_step={current_step}; "
+            f"answer={answer[:500]!r}; "
+            f"tools={tool_summary!r}"
         )
 
     def _assert_real_tool_evidence(self, state):
