@@ -9,6 +9,7 @@ from planning import (
     create_plan,
     record_plan_usage,
 )
+from llm import _to_api_messages
 from runtime import run_agent
 from state import append_user_message, create_state
 
@@ -100,6 +101,28 @@ class RuntimePlanningTests(unittest.TestCase):
             "Now compare paper A and paper B",
         )
 
+    @patch("runtime.uuid4", return_value=SimpleNamespace(hex="reasoning"))
+    @patch(
+        "runtime.decide_next_action",
+        return_value={
+            **PLAN_ACTION,
+            "reasoning_content": "opaque planning reasoning",
+        },
+    )
+    def test_plan_preview_preserves_reasoning_for_the_next_turn(
+        self,
+        _decide,
+        _uuid,
+    ):
+        state = create_state("Compare paper A and paper B")
+
+        run_agent(state)
+
+        self.assertEqual(
+            state["messages"][-1]["reasoning_content"],
+            "opaque planning reasoning",
+        )
+
     @patch("runtime.decide_plan_step", return_value=STEP_FINAL)
     @patch("runtime.decide_next_action")
     def test_active_plan_uses_executor_without_silent_replanning(
@@ -130,6 +153,8 @@ class RuntimePlanningTests(unittest.TestCase):
         self.assertEqual(state["plan"]["steps"][0]["status"], "completed")
         self.assertEqual(state["plan"]["steps"][1]["status"], "pending")
         self.assertIn("max_steps=1", answer)
+        self.assertIn("当前计划仍在进行中", answer)
+        self.assertIn("请输入“继续”", answer)
 
     @patch("runtime.decide_next_action")
     def test_executor_completes_two_steps_and_records_runtime_evidence(
@@ -214,6 +239,7 @@ class RuntimePlanningTests(unittest.TestCase):
             answer = run_agent(state, max_steps=1)
 
         self.assertIn("max_steps=1", answer)
+        self.assertIn("当前计划仍在进行中", answer)
         self.assertEqual(state["plan"]["status"], "running")
         self.assertEqual(state["plan"]["steps"][0]["status"], "running")
         self.assertEqual(
@@ -276,6 +302,66 @@ class RuntimePlanningTests(unittest.TestCase):
         self.assertIn("Tool 执行上限", answer)
         self.assertFalse(
             any(message.get("tool_call") for message in state["messages"])
+        )
+
+    def test_executor_preserves_reasoning_across_plan_steps(self):
+        state = create_state("Compare two papers")
+        state["task_id"] = "task-existing"
+        state["plan"] = create_plan(
+            "task-existing",
+            "Compare two papers",
+            ["Find the papers", "Compare them"],
+        )
+        responses = [
+            {**SEARCH_CALL, "reasoning_content": "search reasoning"},
+            {**STEP_FINAL, "reasoning_content": "first step reasoning"},
+            {
+                **STEP_FINAL,
+                "content": "Comparison complete.",
+                "reasoning_content": "second step reasoning",
+            },
+        ]
+        search = Mock(return_value={"found": False, "papers": []})
+
+        with (
+            patch("runtime.decide_plan_step", side_effect=responses),
+            patch.dict(
+                "runtime.TOOL_REGISTRY",
+                {"search_paper": search},
+                clear=True,
+            ),
+        ):
+            answer = run_agent(state, max_steps=3)
+
+        self.assertEqual(answer, "Comparison complete.")
+        assistant_messages = [
+            message
+            for message in state["messages"]
+            if message["role"] == "assistant"
+        ]
+        self.assertEqual(
+            [
+                message.get("reasoning_content")
+                for message in assistant_messages
+            ],
+            [
+                "search reasoning",
+                "first step reasoning",
+                "second step reasoning",
+            ],
+        )
+        replayed = _to_api_messages(state["messages"])
+        self.assertEqual(
+            [
+                message.get("reasoning_content")
+                for message in replayed
+                if message["role"] == "assistant"
+            ],
+            [
+                "search reasoning",
+                "first step reasoning",
+                "second step reasoning",
+            ],
         )
 
     @patch("runtime.decide_next_action")

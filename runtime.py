@@ -38,6 +38,7 @@ TOOL_REGISTRY = {
     "retrieve_paper_chunks": retrieve_paper_chunks,
 }
 MAX_SEARCH_ATTEMPTS_PER_TURN = 2
+DEFAULT_MAX_STEPS_PER_TURN = 20
 
 
 def decide_next_action(state: dict, *, allow_planning: bool = False) -> dict:
@@ -358,7 +359,7 @@ def _resolve_retrieval_arguments(arguments: dict, state: dict | None) -> dict:
 
 def run_agent(
     state: dict,
-    max_steps: int = 5,
+    max_steps: int = DEFAULT_MAX_STEPS_PER_TURN,
     confirm_save: Callable[[dict], bool] | None = None,
     on_event: EventHandler | None = None,
 ) -> str:
@@ -480,7 +481,7 @@ def run_agent(
                 raise
             answer = _format_plan_answer(plan, created=True)
             state["messages"].append(
-                {"role": "assistant", "content": answer}
+                _assistant_message(response, content=answer)
             )
             _emit_event(
                 on_event,
@@ -496,7 +497,7 @@ def run_agent(
         if response["type"] == "final":
             final_answer = response["content"]
             state["messages"].append(
-                {"role": "assistant", "content": final_answer}
+                _assistant_message(response, content=final_answer)
             )
             if plan_execution:
                 state["plan"] = complete_current_step(state["plan"])
@@ -547,14 +548,15 @@ def run_agent(
             )
 
         state["messages"].append(
-            {
-                "role": "assistant",
-                "tool_call": {
+            _assistant_message(
+                response,
+                content=response.get("content"),
+                tool_call={
                     "id": tool_call_id,
                     "name": tool_name,
                     "arguments": tool_arguments,
                 },
-            }
+            )
         )
         _emit_event(
             on_event,
@@ -640,7 +642,17 @@ def run_agent(
             )
             return cancelled_answer
 
-    stopped_answer = f"Agent stopped after reaching max_steps={max_steps}."
+    if plan_execution:
+        stopped_answer = (
+            "本轮已达到模型决策上限"
+            f"（max_steps={max_steps}），当前计划仍在进行中。"
+            "请输入“继续”从当前步骤恢复执行。"
+        )
+    else:
+        stopped_answer = (
+            "本轮已达到模型决策上限"
+            f"（max_steps={max_steps}），Agent 已停止本轮执行。"
+        )
     state["messages"].append(
         {"role": "assistant", "content": stopped_answer}
     )
@@ -658,14 +670,24 @@ def run_agent(
 
 def _create_runtime_plan(state: dict, action: dict) -> dict:
     """Create trusted Plan fields from one normalized internal plan action."""
-    expected_fields = {
+    required_fields = {
         "type",
         "content",
         "tool_call_id",
         "step_descriptions",
     }
-    if set(action) != expected_fields or action.get("type") != "plan":
+    allowed_fields = {
+        *required_fields,
+        "reasoning_content",
+        "reasoning_details",
+    }
+    if (
+        not required_fields <= set(action)
+        or not set(action) <= allowed_fields
+        or action.get("type") != "plan"
+    ):
         raise ValueError("Invalid internal plan action contract.")
+    _validate_reasoning_fields(action)
     if action.get("content") is not None:
         raise ValueError("An internal plan action cannot contain text.")
     if not isinstance(action.get("tool_call_id"), str) or not action[
@@ -727,6 +749,44 @@ def _format_plan_answer(plan: dict, *, created: bool) -> str:
         for index, step in enumerate(plan["steps"], start=1)
     )
     return "\n".join(lines)
+
+
+def _assistant_message(
+    response: dict,
+    *,
+    content: str | None,
+    tool_call: dict | None = None,
+) -> dict:
+    """Build an Assistant State message with opaque reasoning metadata."""
+    _validate_reasoning_fields(response)
+    message = {"role": "assistant", "content": content}
+    if tool_call is not None:
+        message["tool_call"] = tool_call
+    if "reasoning_details" in response:
+        message["reasoning_details"] = deepcopy(response["reasoning_details"])
+    elif "reasoning_content" in response:
+        message["reasoning_content"] = response["reasoning_content"]
+    return message
+
+
+def _validate_reasoning_fields(response: dict) -> None:
+    present = {
+        field
+        for field in ("reasoning_content", "reasoning_details")
+        if field in response
+    }
+    if len(present) > 1:
+        raise ValueError(
+            "A normalized response cannot contain two reasoning representations."
+        )
+    if "reasoning_content" in present and not isinstance(
+        response["reasoning_content"], str
+    ):
+        raise ValueError("reasoning_content must be text.")
+    if "reasoning_details" in present and not isinstance(
+        response["reasoning_details"], list
+    ):
+        raise ValueError("reasoning_details must be a list.")
 
 
 def _finish_plan_at_budget_limit(

@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import unittest
@@ -13,7 +14,7 @@ from main import confirm_save
 from main import main as run_cli
 from main import print_debug_trace
 from llm import _normalize_api_response
-from runtime import execute_tool, run_agent
+from runtime import DEFAULT_MAX_STEPS_PER_TURN, execute_tool, run_agent
 from state import append_user_message, create_state
 from tools import list_library, save_paper, search_paper
 from tools.search import (
@@ -834,6 +835,12 @@ class AgentV1Tests(unittest.TestCase):
             ["user", "assistant", "tool", "assistant"],
         )
         self.assertEqual(state["messages"][-1]["content"], answer)
+
+    def test_default_turn_limit_is_twenty_llm_decisions(self):
+        default = inspect.signature(run_agent).parameters["max_steps"].default
+
+        self.assertEqual(DEFAULT_MAX_STEPS_PER_TURN, 20)
+        self.assertEqual(default, DEFAULT_MAX_STEPS_PER_TURN)
 
     def test_max_steps_applies_to_each_conversational_turn(self):
         first_response = {

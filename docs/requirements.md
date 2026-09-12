@@ -7,8 +7,9 @@
 
 当前版本定位：V1 最小 Agent Loop、V2 真实搜索/管理/阅读/最小检索、V2.0.1
 提取正确性和交互式终端，以及 V2.1 全文索引、离线评测、资源测量和排序方法选择
-均已完成。V3 已完成 Plan 纯数据层、Planner 输入边界、Runtime 可信 Plan 创建和
-最小 step Executor；Replan、blocked 与 Checkpoint 尚未实现。
+均已完成。V3 已完成 Plan 纯数据层、Planner 输入边界、Runtime 可信 Plan 创建、
+最小 step Executor 和 DeepSeek thinking 多步消息协议；Replan、blocked 与
+Checkpoint 尚未实现。
 
 ## 2. 学习目标
 
@@ -54,6 +55,15 @@ Agent = LLM + Tools + Loop + State
 - V1 每个 LLM step 最多处理一个 Tool Call。
 - Provider 同时返回多个 Tool Calls 时，只将第一个归一化并交给 Runtime；其余
   调用不执行，模型观察第一个结果后再决定下一步。
+- DeepSeek 必须显式配置 thinking 开关和 reasoning effort；不能依赖模型端可能变化
+  的默认值。OpenRouter 的 reasoning 配置保持可选，只在所选模型支持时启用。
+- Provider 返回的 `reasoning_content`、`reasoning` 字符串别名或结构化
+  `reasoning_details` 必须在 `llm.py` 归一为至多一种内部表示。没有推理字段的响应
+  必须保持原有 `final|tool_call` 契约。
+- Runtime 必须把归一化 reasoning 作为对应 Assistant 消息的不透明协议元数据保存，
+  不得解释、修改或当作文献证据；后续 Provider 请求必须原样回传。
+- 普通终端、Debug Trace 和 Runtime Event 不得输出 reasoning 内容。Checkpoint 是否
+  持久化该字段须在恢复功能实现前单独评估。
 
 ### FR-3：文献搜索
 
@@ -235,7 +245,9 @@ pdf_url
   不得控制或中断 Agent Loop，也不得通过可变事件内容修改 Tool 调用或 State。
 - LLM 或 Tool 执行被用户中断时，Runtime 必须用 Assistant 收尾；Tool 已经产生
   Tool Call 时还必须补写 `cancelled` Tool Result，不能留下不完整消息协议。
-- `max_steps` 必须在模型不能结束时终止当前轮；每次用户新输入后重新计数。
+- `max_steps` 必须在模型不能结束时终止当前轮；默认值为 20，每次用户新输入后重新
+  计数。活动 Plan 到达该上限时必须保留 Plan，并明确提示用户可输入“继续”；不得
+  把本轮暂停误报为整个任务失败。
 - Runtime 必须在每次 `run_agent()` 调用中记录已经尝试的有效搜索 query；比较前
   折叠首尾及连续空白，与 `search_paper` 的规范化一致。
 - 同一用户轮次的重复 query 必须返回 `duplicate_search_query` 结构化错误，不得
@@ -340,7 +352,14 @@ Planner 规范化后的字段，Runtime 使用最新用户消息和本地 UUID �
 步骤和当前 step 作为有界控制 Context 交给现有 Agent Loop。每次仍只执行一个 Tool
 Call；Runtime 为 Tool Result 分配 `tool-result-NNN` 引用并同时写入 Tool 消息与当前
 step。step-level final 才完成 step 并进入下一步。Runtime 在调用前阻止超过 32 次
-LLM 决策或 24 次 Tool 执行。Replan、blocked 与 Checkpoint 仍未接入。
+LLM 决策或 24 次 Tool 执行。
+
+DeepSeek thinking 多步协议也已接入：`llm.py` 提取每个 Assistant 响应的推理元数据，
+Planner 在内部化 `submit_plan` 时保留它，Runtime 将其附着到 Plan 预览、Tool Call
+和 step-level final 对应的 Assistant State 消息，下一次请求再由 `llm.py` 原样序列化。
+这样第三次及之后的 thinking Tool Calling 请求不会因丢失历史
+`reasoning_content` 被 Provider 拒绝。OpenRouter 的字符串与结构化 reasoning 格式
+已有离线兼容测试。Replan、blocked 与 Checkpoint 仍未接入。
 
 ### FR-18：V3 Checkpoint 与恢复（计划需求，尚未实现）
 

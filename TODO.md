@@ -23,9 +23,9 @@ V3：Planning + Replanning + Checkpoint
 ```
 
 当前状态：V1、V2、V2.0.1 和 V2.1 均已完成。V3 已完成 Plan 纯数据层、Planner
-输入边界、Runtime 可信 Plan 创建和最小 step Executor；尚未接入 Replan、blocked
-或 Checkpoint。目标是让单 Agent 对多论文任务进行显式规划、有限重规划，并在
-进程退出后恢复同一任务。
+输入边界、Runtime 可信 Plan 创建、最小 step Executor 和 DeepSeek thinking 多步
+消息协议；尚未接入 Replan、blocked 或 Checkpoint。目标是让单 Agent 对多论文
+任务进行显式规划、有限重规划，并在进程退出后恢复同一任务。
 
 ---
 
@@ -323,35 +323,46 @@ Context 原则。
 下一条用户消息开始执行；每次 Tool Result 在对应 Tool 消息和当前 step 中写入同一个
 Runtime-owned `tool-result-NNN` 引用，Tool 本身不会完成 step。多个 step 在同一个
 现有 Loop 内串行推进，step-level final 才触发完成；达到单轮 `max_steps` 时保留活动
-Plan，后续轮次可以继续。新增 2 项 Executor 测试、4 项 Runtime 执行/预算测试和
-1 项 evidence 转换测试；真实 arXiv + DeepSeek 全量 142 项通过，无跳过。
+Plan，后续轮次可以继续。单轮默认值已由 5 调整为 20；如果活动 Plan 仍达到上限，
+终端用中文说明任务只是暂停并提示输入“继续”。任务级 32 次 LLM 决策和 24 次 Tool
+执行上限保持不变。新增 2 项 Executor 测试、4 项 Runtime 执行/预算测试和 1 项
+evidence 转换测试；最小 Executor 阶段真实 arXiv + DeepSeek 全量 142 项通过、无
+跳过。
 
-### Step 2 前置：DeepSeek thinking 消息协议升级（单独分支）
+### Step 2 前置：DeepSeek thinking 消息协议升级（已完成）
 
 开始修改 thinking 协议前必须先完成以下 Git 边界，避免把已经完成的 Plan/Planner
 工作与 Provider 消息协议混在同一个提交中：
 
-- [ ] Codex 先提醒用户提交当前工作，不得直接开始修改 `llm.py`。
-- [ ] 用户完成提交后，检查 `git status` 确认工作区干净。
-- [ ] 从已提交的当前分支创建并切换到新分支，例如：
+- [x] Codex 先提醒用户提交当前工作，不得直接开始修改 `llm.py`。
+- [x] 用户完成提交后，检查 `git status` 确认工作区干净。
+- [x] 从已提交的当前分支创建并切换到新分支，例如：
   `git checkout -b feat/deepseek-thinking-protocol`。
-- [ ] 再次确认分支名和工作区状态，之后才能开始 thinking 协议修改。
+- [x] 再次确认分支名和工作区状态，之后才能开始 thinking 协议修改。
 
 thinking 协议的实现范围：
 
-- [ ] 在 `llm.py` 中显式配置 thinking 开关和 reasoning effort，不依赖模型默认行为。
-- [ ] `_normalize_api_response()` 提取 Provider 返回的 `reasoning_content`，同时兼容
+- [x] 在 `llm.py` 中显式配置 thinking 开关和 reasoning effort，不依赖模型默认行为。
+- [x] `_normalize_api_response()` 提取 Provider 返回的 `reasoning_content`，同时兼容
   非 thinking 响应没有该字段的情况。
-- [ ] Runtime 将 `reasoning_content` 作为不透明 Assistant 消息字段写入 State；不
+- [x] Runtime 将 `reasoning_content` 作为不透明 Assistant 消息字段写入 State；不
   解析、不修改，也不将它当作文献证据。
-- [ ] `_to_api_messages()` 在带 Tool 的后续 DeepSeek 请求中原样回传对应
+- [x] `_to_api_messages()` 在带 Tool 的后续 DeepSeek 请求中原样回传对应
   `reasoning_content`，保持 Tool Calling 消息协议完整。
-- [ ] 普通终端和 Debug 默认不显示 reasoning 内容；后续 Checkpoint 是否保存该字段
+- [x] 普通终端和 Debug 默认不显示 reasoning 内容；后续 Checkpoint 是否保存该字段
   必须在实现恢复前单独评估大小、隐私和 Provider 兼容性。
-- [ ] 增加响应解析、消息序列化、thinking Tool Call 多轮回传、非 thinking 兼容和
+- [x] 增加响应解析、消息序列化、thinking Tool Call 多轮回传、非 thinking 兼容和
   OpenRouter 缺少或使用不同 reasoning 字段时的测试。
-- [ ] 完成后显式运行 DeepSeek 联网测试，不得把联网用例计为跳过，并同步更新
+- [x] 完成后显式运行 DeepSeek 联网测试，不得把联网用例计为跳过，并同步更新
   `docs/agent-development-process.md`。
+
+修复结果：DeepSeek 默认显式启用 thinking，并将每个模型 Assistant 响应的
+`reasoning_content` 作为不透明字段写入 State、在所有后续请求中原样回传；
+OpenRouter 同时兼容字符串 reasoning 和结构化 `reasoning_details`，但默认不强制
+开启推理。普通与 Debug 终端都不显示该字段。新增 13 项协议、Planner、Runtime 和
+真实 DeepSeek 集成测试；启用真实 arXiv 与 DeepSeek 后，全量 155 项通过、无跳过。
+OpenRouter 兼容性当前由 Mock API 响应和请求参数覆盖，尚未使用真实 OpenRouter
+Key 验收。下一步进入有限 Replan 与 `blocked`。
 
 ### Step 3：Checkpoint 与恢复
 

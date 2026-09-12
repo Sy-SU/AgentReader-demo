@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from copy import deepcopy
 
 from dotenv import load_dotenv
 
@@ -20,14 +21,29 @@ PROVIDERS = {
         "api_key_env": "DEEPSEEK_API_KEY",
         "model_env": "DEEPSEEK_MODEL",
         "default_model": "deepseek-v4-flash",
+        "thinking_env": "DEEPSEEK_THINKING",
+        "reasoning_effort_env": "DEEPSEEK_REASONING_EFFORT",
+        "default_thinking": "enabled",
+        "default_reasoning_effort": "high",
     },
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "api_key_env": "OPENROUTER_API_KEY",
         "model_env": "OPENROUTER_MODEL",
         "default_model": None,
+        "thinking_env": "OPENROUTER_THINKING",
+        "reasoning_effort_env": "OPENROUTER_REASONING_EFFORT",
+        "default_thinking": None,
+        "default_reasoning_effort": None,
     },
 }
+THINKING_MODES = frozenset({"enabled", "disabled"})
+DEEPSEEK_REASONING_EFFORTS = frozenset(
+    {"low", "medium", "high", "xhigh", "max"}
+)
+OPENROUTER_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
 
 
 def call_llm(messages: list[dict], tools: list[dict]) -> dict:
@@ -72,12 +88,14 @@ def call_llm(messages: list[dict], tools: list[dict]) -> dict:
         api_key=api_key,
         base_url=base_url,
     )
+    request_options = _provider_reasoning_options(provider, config)
     try:
         response = client.chat.completions.create(
             model=model,
             messages=_to_api_messages(messages),
             tools=_to_api_tools(tools),
             tool_choice="auto",
+            **request_options,
         )
     except APIError as error:
         status_code = getattr(error, "status_code", None)
@@ -439,25 +457,25 @@ def _to_api_messages(messages: list[dict]) -> list[dict]:
     for message in messages:
         if "tool_call" in message:
             tool_call = message["tool_call"]
-            api_messages.append(
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": tool_call["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tool_call["name"],
-                                "arguments": json.dumps(
-                                    tool_call["arguments"],
-                                    ensure_ascii=False,
-                                ),
-                            },
-                        }
-                    ],
-                }
-            )
+            api_message = {
+                "role": "assistant",
+                "content": message.get("content"),
+                "tool_calls": [
+                    {
+                        "id": tool_call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tool_call["name"],
+                            "arguments": json.dumps(
+                                tool_call["arguments"],
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            }
+            _copy_reasoning_fields(message, api_message)
+            api_messages.append(api_message)
             continue
 
         if message["role"] == "tool":
@@ -472,12 +490,13 @@ def _to_api_messages(messages: list[dict]) -> list[dict]:
             )
             continue
 
-        api_messages.append(
-            {
-                "role": message["role"],
-                "content": message["content"],
-            }
-        )
+        api_message = {
+            "role": message["role"],
+            "content": message["content"],
+        }
+        if message["role"] == "assistant":
+            _copy_reasoning_fields(message, api_message)
+        api_messages.append(api_message)
 
     return api_messages
 
@@ -489,6 +508,7 @@ def _normalize_api_response(response: dict) -> dict:
     except (KeyError, IndexError, TypeError) as error:
         raise RuntimeError("LLM API response has no assistant message.") from error
 
+    reasoning_fields = _normalize_reasoning_fields(message)
     tool_calls = message.get("tool_calls") or []
     if tool_calls:
         # Keep the Runtime sequential even if a provider proposes parallel
@@ -498,13 +518,19 @@ def _normalize_api_response(response: dict) -> dict:
             arguments = json.loads(tool_call["function"]["arguments"])
             if not isinstance(arguments, dict):
                 raise TypeError("tool arguments must decode to an object")
-            return {
+            normalized = {
                 "type": "tool_call",
-                "content": None,
+                "content": (
+                    message.get("content")
+                    if isinstance(message.get("content"), str)
+                    else None
+                ),
                 "tool_call_id": tool_call["id"],
                 "tool_name": tool_call["function"]["name"],
                 "tool_arguments": arguments,
             }
+            normalized.update(reasoning_fields)
+            return normalized
         except (KeyError, TypeError, json.JSONDecodeError) as error:
             raise RuntimeError("LLM returned an invalid tool call.") from error
 
@@ -512,10 +538,102 @@ def _normalize_api_response(response: dict) -> dict:
     if not isinstance(content, str):
         raise RuntimeError("LLM returned neither text nor a tool call.")
 
-    return {
+    normalized = {
         "type": "final",
         "content": content,
         "tool_call_id": None,
         "tool_name": None,
         "tool_arguments": None,
     }
+    normalized.update(reasoning_fields)
+    return normalized
+
+
+def _provider_reasoning_options(provider: str, config: dict) -> dict:
+    """Build explicit provider request options without exposing secrets."""
+    thinking = _environment_setting(
+        "LLM_THINKING",
+        config["thinking_env"],
+        config["default_thinking"],
+    )
+    effort = _environment_setting(
+        "LLM_REASONING_EFFORT",
+        config["reasoning_effort_env"],
+        config["default_reasoning_effort"],
+    )
+
+    if thinking is not None and thinking not in THINKING_MODES:
+        raise RuntimeError(
+            "Thinking mode must be 'enabled' or 'disabled'."
+        )
+
+    if provider == "deepseek":
+        if effort not in DEEPSEEK_REASONING_EFFORTS:
+            allowed = ", ".join(sorted(DEEPSEEK_REASONING_EFFORTS))
+            raise RuntimeError(
+                f"DeepSeek reasoning effort must be one of: {allowed}."
+            )
+        options = {"extra_body": {"thinking": {"type": thinking}}}
+        if thinking == "enabled":
+            options["reasoning_effort"] = effort
+        return options
+
+    if effort is not None and effort not in OPENROUTER_REASONING_EFFORTS:
+        allowed = ", ".join(sorted(OPENROUTER_REASONING_EFFORTS))
+        raise RuntimeError(
+            f"OpenRouter reasoning effort must be one of: {allowed}."
+        )
+    if thinking == "disabled" and effort not in {None, "none"}:
+        raise RuntimeError(
+            "OpenRouter disabled thinking requires reasoning effort 'none'."
+        )
+    if thinking == "enabled" and effort == "none":
+        raise RuntimeError(
+            "OpenRouter enabled thinking cannot use reasoning effort 'none'."
+        )
+
+    reasoning = None
+    if thinking == "disabled" or effort == "none":
+        reasoning = {"effort": "none"}
+    elif effort is not None:
+        reasoning = {"effort": effort, "exclude": False}
+    elif thinking == "enabled":
+        reasoning = {"enabled": True, "exclude": False}
+    if reasoning is None:
+        return {}
+    return {"extra_body": {"reasoning": reasoning}}
+
+
+def _environment_setting(
+    generic_name: str,
+    provider_name: str,
+    default: str | None,
+) -> str | None:
+    value = os.getenv(generic_name) or os.getenv(provider_name) or default
+    return value.strip().lower() if isinstance(value, str) else value
+
+
+def _normalize_reasoning_fields(message: dict) -> dict:
+    """Normalize provider reasoning metadata for opaque State replay."""
+    reasoning_details = message.get("reasoning_details")
+    if reasoning_details is not None:
+        if not isinstance(reasoning_details, list):
+            raise RuntimeError("LLM returned invalid reasoning_details.")
+        return {"reasoning_details": deepcopy(reasoning_details)}
+
+    for field in ("reasoning_content", "reasoning"):
+        value = message.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise RuntimeError("LLM returned invalid reasoning content.")
+        return {"reasoning_content": value}
+    return {}
+
+
+def _copy_reasoning_fields(source: dict, target: dict) -> None:
+    """Copy one normalized reasoning representation without inspecting it."""
+    if "reasoning_details" in source:
+        target["reasoning_details"] = deepcopy(source["reasoning_details"])
+    elif "reasoning_content" in source:
+        target["reasoning_content"] = source["reasoning_content"]

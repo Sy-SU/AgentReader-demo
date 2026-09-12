@@ -586,8 +586,9 @@ V2.1 已完成全文覆盖和检索评测。下一阶段优先建立显式任务
 
 ### 7.5 V3：可恢复的单 Agent 计划执行器
 
-- **状态**：Plan 纯数据层、Planner 输入边界、Runtime 可信 Plan 创建和最小 Executor
-  已经完成；Replan、blocked 与 Checkpoint 尚未接入。
+- **状态**：Plan 纯数据层、Planner 输入边界、Runtime 可信 Plan 创建、最小 Executor
+  和 DeepSeek thinking 多步消息协议已经完成；Replan、blocked 与 Checkpoint 尚未
+  接入。
 - **阶段目标**：让单 Agent 把多论文、多交付结果的用户目标拆成显式 Plan，串行执行
   当前步骤，在有限条件下 Replan，并在进程退出后恢复同一个未完成任务。
 - **目标示例**：搜索两个方向的代表论文，下载 PDF，分别检索方法与实验结果，再
@@ -637,13 +638,35 @@ V2.1 已完成全文覆盖和检索评测。下一阶段优先建立显式任务
   同时记录 LLM/Tool 预算并在调用前阻止越界。新增 2 项 Executor、4 项 Runtime
   执行/预算和 1 项 evidence 转换测试；真实 arXiv + DeepSeek 全量 142 项通过，无
   跳过。
-- **下一小步**：先提交当前 Plan/Planner/Executor 工作，再在单独分支升级 DeepSeek
-  thinking Tool Calling 消息协议；之后实现有限 Replan 与 blocked。
+- **thinking 协议观察**：真实多步任务在计划创建、一次 Tool Call 和 step-level
+  final 后发起第三次模型请求时，DeepSeek 返回 HTTP 400，明确要求回传此前
+  `reasoning_content`。这说明 reasoning 不是只用于显示的中间文本，而是 thinking
+  Tool Calling 的会话协议字段。
+- **thinking 协议结果**：在独立分支 `feat/deepseek-thinking-protocol` 中由 `llm.py`
+  显式配置 thinking 和 reasoning effort，并把 DeepSeek `reasoning_content`、
+  OpenRouter 字符串 reasoning 或结构化 `reasoning_details` 归一为不透明字段。
+  Planner 内部化 `submit_plan` 时保留该字段，Runtime 将它写入对应 Assistant State
+  消息，`llm.py` 在所有后续请求中原样回传。普通终端、Debug Trace 和 Runtime
+  Event 都不显示 reasoning。新增 13 项协议、Planner、Runtime 与真实 DeepSeek
+  集成测试；启用真实 arXiv 与 DeepSeek 后，全量 155 项通过、无跳过。OpenRouter
+  当前完成离线协议兼容测试，未使用真实 OpenRouter Key 验收。
+- **测试设计修正**：首次全量联网测试中，真实模型把最初测试提示判为简单任务，
+  没有生成 Plan；这不是协议失败。集成测试随后使用仅暴露 `submit_plan` 的受控
+  Planner 指令，稳定进入需要验证的多步协议路径，而 Executor 和 Provider 仍使用
+  真实生产链路。
+- **单轮上限调整**：复杂 Plan 在第 5 次 LLM 决策完成 PDF 下载后触发旧的 V1
+  `max_steps=5`，状态虽然保留，但英文 `Agent stopped` 容易被理解成任务失败。
+  默认值调整为 20，仍低于任务级 32 次 LLM 决策上限；活动 Plan 真正到限时改为
+  中文说明本轮暂停并提示输入“继续”，不改变 Plan 状态和任务预算。
+- **下一小步**：实现有限 Replan 与 `blocked`，并继续保留 Runtime 对状态、预算、
+  evidence 和副作用权限的独占写入。
 
 ## 8. 更新记录
 
 | 日期 | 阶段 | 更新内容 | 证据 |
 |---|---|---|---|
+| 2026-09-12 | V3 单轮执行上限 | 默认 `max_steps` 从 5 调整为 20；活动 Plan 到限时保留状态并提示继续 | 新增 1 项默认值测试；真实 arXiv + DeepSeek 全量 156 项通过、无跳过；任务级 32/24 预算不变 |
+| 2026-09-12 | V3 DeepSeek thinking 协议 | 显式 thinking 配置；跨 Plan、Tool Call 和 step final 原样回传 reasoning；OpenRouter 格式兼容；终端不显示推理字段 | 13 项新增测试；真实 arXiv + DeepSeek 全量 155 项通过、无跳过 |
 | 2026-09-12 | V3 最小 Executor | 当前 step 控制 Context、串行 Tool Loop、step-level final、可信 evidence 和执行前预算边界 | 7 项新增测试；真实 arXiv + DeepSeek 全量 142 项通过、无跳过 |
 | 2026-09-12 | V3 Runtime 创建 | 首次 Planner 决策创建 Runtime-owned task ID、Plan 和初始预算；简单任务保持 V2 路径 | 6 项 Runtime Planning + 1 项预算测试；真实 arXiv + DeepSeek 全量 135 项通过、无跳过 |
 | 2026-09-12 | V3 Planner 边界 | 增加内部 `submit_plan` Schema、规划 instructions 和三类初始动作归一化 | 8 项 Planner 测试；真实 arXiv + DeepSeek 全量 128 项通过、无跳过 |

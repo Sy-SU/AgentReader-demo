@@ -152,6 +152,19 @@ class PlannerContractTests(unittest.TestCase):
                 ):
                     normalize_initial_action(invalid)
 
+    def test_submit_plan_preserves_opaque_reasoning_for_state_replay(self):
+        response = {
+            **PLAN_CALL,
+            "reasoning_content": "opaque planning reasoning",
+        }
+
+        action = normalize_initial_action(response)
+
+        self.assertEqual(
+            action["reasoning_content"],
+            "opaque planning reasoning",
+        )
+
     def test_malformed_initial_responses_are_rejected(self):
         invalid_responses = [
             None,

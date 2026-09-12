@@ -31,6 +31,8 @@ LLM 决策 -> Runtime 执行 Tool -> Tool Result 写回 State -> LLM 再决策
   交互式终端也已完成；V2.1 的全文覆盖、检索评测、资源测量和排序方法选择均已
   完成。V3 已完成 Plan 数据契约、Planner 输入边界、Runtime 可信 Plan 创建和最小
   step Executor；Replan、blocked 与 Checkpoint 尚未接入。
+- DeepSeek thinking Tool Calling 已支持多步回传：模型返回的 reasoning 元数据只在
+  State 中作为不透明协议字段保存并回传，不会显示在普通终端或 Debug Trace 中。
 
 V3 的单一目标是“可恢复的单 Agent 计划执行器”：为多论文、多步骤任务增加显式
 Planning、有限 Replanning 和本地 Checkpoint 恢复。当前 `planning.py` 已提供最多
@@ -45,6 +47,8 @@ Tool Calling 和框架无关；长期 Memory、Multi-Agent、LangGraph、MCP、�
 创建后先显示 Plan，下一条用户消息会启动第一个 pending step。`executor.py` 只向
 模型注入当前 step；Tool Result 先成为 Runtime 生成的可信 evidence reference，只有
 step-level final 才完成该 step。任务累计最多 32 次 LLM 决策和 24 次 Tool 执行。
+单个用户轮次默认最多进行 20 次 LLM 决策；如果活动 Plan 到达这个上限，Runtime
+保留计划进度并提示输入“继续”，而不是把整项任务标记为失败。
 
 详细范围和信息流见：
 
@@ -92,6 +96,18 @@ cp .env.example .env
 - `LLM_PROVIDER=openrouter`：配置 `OPENROUTER_API_KEY` 和 `OPENROUTER_MODEL`
 
 `LLM_MODEL` 和 `LLM_BASE_URL` 可以临时覆盖当前 Provider 的默认配置。
+
+DeepSeek 请求默认显式使用 `DEEPSEEK_THINKING=enabled` 和
+`DEEPSEEK_REASONING_EFFORT=high`。如果要测试非 thinking 模式，可将前者设为
+`disabled`；此时不会发送 reasoning effort。OpenRouter 默认不主动开启推理，只有
+所选模型支持时才配置 `OPENROUTER_THINKING=enabled` 和
+`OPENROUTER_REASONING_EFFORT`。`LLM_THINKING` 与 `LLM_REASONING_EFFORT` 可作
+当前 Provider 的一次性通用覆盖。
+
+thinking 模式下，Provider 返回的 `reasoning_content` 或 `reasoning_details` 会随
+对应 Assistant 消息保留并在后续请求中原样回传。这是 Tool Calling 消息协议的一
+部分，不是文献证据，也不会作为 Debug 内容输出。Checkpoint 尚未实现；是否把该
+字段持久化会在恢复功能开始前单独评估。
 
 ## 运行
 
@@ -160,7 +176,8 @@ RUN_LIVE_ARXIV_TESTS=1 python -m unittest \
   tests.test_arxiv_integration -v
 ```
 
-显式运行 DeepSeek 在线测试（会产生一次完整 Agent Loop 的 API 请求）：
+显式运行 DeepSeek 在线测试（包含普通 Tool Loop 和 thinking 多步 Plan，会产生
+真实 API 请求）：
 
 ```bash
 RUN_LIVE_LLM_TESTS=1 python -m unittest \

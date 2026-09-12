@@ -122,9 +122,34 @@ def normalize_initial_action(response: object) -> dict:
             f"invalid submit_plan steps: {error}"
         ) from error
 
-    return {
+    action = {
         "type": "plan",
         "content": None,
         "tool_call_id": tool_call_id,
         "step_descriptions": step_descriptions,
     }
+    _copy_reasoning_fields(response, action)
+    return action
+
+
+def _copy_reasoning_fields(source: dict, target: dict) -> None:
+    """Preserve normalized opaque reasoning when submit_plan is internalized."""
+    present = {
+        field
+        for field in ("reasoning_content", "reasoning_details")
+        if field in source
+    }
+    if len(present) > 1:
+        raise PlannerResponseError(
+            "a response cannot contain two reasoning representations."
+        )
+    if "reasoning_content" in present:
+        value = source["reasoning_content"]
+        if not isinstance(value, str):
+            raise PlannerResponseError("reasoning_content must be text.")
+        target["reasoning_content"] = value
+    if "reasoning_details" in present:
+        value = source["reasoning_details"]
+        if not isinstance(value, list):
+            raise PlannerResponseError("reasoning_details must be a list.")
+        target["reasoning_details"] = deepcopy(value)

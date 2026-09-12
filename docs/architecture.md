@@ -61,6 +61,8 @@ llm.py 调用 Fake / DeepSeek / OpenRouter
 
 - 创建单次任务的普通 `dict`。
 - 保存原始请求、多轮消息历史和累计 LLM step 数量。
+- Assistant 消息可带一份归一化的 `reasoning_content` 或
+  `reasoning_details`；State 只为后续 Provider 协议回传保存它，不解释其内容。
 - 提供追加后续用户消息的最小操作。
 - 当前没有跨任务 Memory。
 
@@ -77,10 +79,15 @@ llm.py 调用 Fake / DeepSeek / OpenRouter
 - 把内部 Tool Schema 转成 OpenAI Chat Completions 工具格式。
 - 把内部 messages 转成 Provider API messages。
 - 将 Provider 响应归一为内部的 `final` 或 `tool_call`。
+- 显式生成 DeepSeek thinking / reasoning effort 请求选项，并按需生成 OpenRouter
+  reasoning 选项。
+- 将 DeepSeek 的 `reasoning_content`、OpenRouter 的 `reasoning` 字符串别名或
+  `reasoning_details` 归一化，并在后续请求中原样序列化。
 - Provider 返回多个 Tool Calls 时只归一化第一个，保持 Runtime 串行执行。
 - Fake LLM 为离线测试提供确定性行为。
 
-Provider 特有字段到此为止，Agent 和 Runtime 不解析厂商响应。
+Provider 原始格式到此为止。Agent 和 Runtime 不解析厂商响应或 reasoning 内容；
+Runtime 只保存 `llm.py` 已归一化的不透明协议字段。
 
 ### `runtime.py`
 
@@ -95,10 +102,13 @@ Provider 特有字段到此为止，Agent 和 Runtime 不解析厂商响应。
 - 在每次 `run_agent()` 调用中维护本轮搜索 query 集合，阻止相同有效 query 再次
   到达搜索 Tool，并把不同 query 的数量限制为 2；下一用户轮次重新创建集合。
 - 执行 Tool，并将结果或结构化错误写回 State。
+- 将每次归一化模型响应的 reasoning 元数据附着到对应 Assistant State 消息，使
+  `llm.py` 能在下次请求中恢复完整的 thinking Tool Calling 历史。
 - 通过可选回调发出 LLM、Tool、结束和失败事件；发给观察者的是深拷贝，回调异常
   不得改变 Agent Loop。
 - 在 LLM 或 Tool 被用户中断时补齐消息协议，并用 `cancelled` 状态结束当前轮。
-- 更新累计 step，处理本轮 final，并用每轮 `max_steps` 阻止无限循环。
+- 更新累计 step，处理本轮 final，并用每轮默认 20 次的 `max_steps` 阻止无限循环；
+  活动 Plan 到限时保留进度并提示用户输入“继续”。
 
 Runtime 是执行和约束层。它限制保存、下载和提取操作只能引用当前任务中的可信
 Tool Result，并强制保存操作必须经过人工确认。`terminal.py` 负责具体终端交互，
@@ -147,6 +157,8 @@ Tool 包通过 `tools/__init__.py` 暴露稳定公共接口，调用方继续使
 ```python
 {
     "role": "assistant",
+    "content": None,
+    "reasoning_content": "...",  # 可选；不透明且不向终端显示
     "tool_call": {
         "id": "...",
         "name": "search_paper",
@@ -168,6 +180,10 @@ Tool 包通过 `tools/__init__.py` 暴露稳定公共接口，调用方继续使
 
 `tool_call_id` 将某一次调用与结果配对。Tool Result 进入 messages 后，LLM 才能
 看到真实执行结果并决定是继续调用工具还是返回 final。
+
+thinking Provider 的 Assistant 消息还可以带 `reasoning_content`，或用
+`reasoning_details` 保存 OpenRouter 的结构化格式。内部消息至多保留一种表示；这些
+字段只随对应 Assistant 消息回传 Provider，不进入 Runtime Event 或终端输出。
 
 ### Runtime Event
 
@@ -199,6 +215,7 @@ State 中的结果。
     "tool_call_id": "...",
     "tool_name": "search_paper",
     "tool_arguments": {"query": "TASA"},
+    "reasoning_content": "...",  # 可选
 }
 ```
 
@@ -211,8 +228,15 @@ State 中的结果。
     "tool_call_id": None,
     "tool_name": None,
     "tool_arguments": None,
+    "reasoning_content": "...",  # 可选
 }
 ```
+
+上面可选的 `reasoning_content` 也可能由 `reasoning_details: list` 代替，二者不能
+同时出现。无 thinking 响应继续保持原结构。Runtime 将它视为 Provider 协议元数据，
+不会分析、裁剪或作为 evidence reference；`llm.py` 在下一次请求中把它复制回对应
+Assistant 消息。DeepSeek thinking 模式要求完整回传此前轮次，因此 Plan 预览、
+Tool Call 和 step-level final 都必须经过同一条保存链路。
 
 V1 每一步只接受一个 Tool Call。如果 Provider 同时返回多个 Tool Calls，
 `llm.py` 只保留第一个。Runtime 执行并写回结果后，LLM 可以在下一 step 再提出
@@ -762,7 +786,8 @@ Runtime 只计数和拒绝，不生成第二个 query。是否根据 `no_lexical
   `cancelled` 结束当前轮；下一条用户输入仍可继续。
 - 交互终端发生可恢复的 Runtime 错误：显示错误并继续等待；管道输入发生同类错误：
   以非零状态码退出。
-- 达到最大步数：Runtime 返回停止信息并结束循环。
+- 达到单轮最大步数：Runtime 结束本轮；活动 Plan 保持 `running` 并返回可继续提示，
+  非计划请求返回本轮停止信息。任务级预算仍独立限制累计 LLM 和 Tool 次数。
 
 ## 9. 数据和副作用边界
 
@@ -836,6 +861,9 @@ Planner 使用仅供结构化输出的 `submit_plan` Schema。它不是外部 To
 `tools/` 包或 `TOOL_REGISTRY`，也不会被“执行”；`planner.py` 只读取归一化
 `tool_call.arguments`，随后由 `planning.py` 校验。这样可以复用 DeepSeek 与
 OpenRouter 已有 Tool Calling 协议，同时保持 Provider 解析仍只存在于 `llm.py`。
+`planner.py` 在把 `submit_plan` 内部化为 `plan` 动作时同时保留已归一化的 reasoning
+元数据；Runtime 生成 Plan 预览 Assistant 消息时再把它写入 State，避免下一次
+DeepSeek 请求丢失创建计划那一轮的 `reasoning_content`。
 
 新任务的第一次 LLM 决策可以在 `submit_plan`、现有外部 Tool Call 和 `final` 之间
 选择：复合任务提交高层步骤，简单任务保持 V2 路径。这避免额外调用一次分类模型，
