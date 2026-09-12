@@ -116,6 +116,31 @@ class TerminalUITests(unittest.TestCase):
         self.assertIn("第 3、5 页", rendered)
         self.assertIn("复用索引/全文覆盖", rendered)
 
+    def test_normal_terminal_explains_low_query_coverage_rejection(self):
+        output = StringIO()
+        terminal = TerminalUI(plain=True, output=output)
+        terminal.handle_event(
+            {
+                "kind": "tool_finished",
+                "turn_step": 1,
+                "total_step": 1,
+                "tool_name": "retrieve_paper_chunks",
+                "duration_ms": 10.0,
+                "result": {
+                    "found": False,
+                    "count": 0,
+                    "matches": [],
+                    "query_term_coverage": 0.333333,
+                    "minimum_query_term_coverage": 0.5,
+                    "rejected_low_query_coverage": True,
+                },
+            }
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("查询证据不足", rendered)
+        self.assertIn("查询词覆盖 33% < 50%", rendered)
+
     def test_cli_commands_do_not_enter_state_and_clear_starts_new_state(self):
         inputs = iter(
             [

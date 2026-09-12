@@ -1,5 +1,6 @@
 import json
 import os
+import re
 
 from dotenv import load_dotenv
 
@@ -141,7 +142,7 @@ def _call_fake_llm(messages: list[dict], tools: list[dict]) -> dict:
                     "tool_name": "retrieve_paper_chunks",
                     "tool_arguments": {
                         "paper_id": result["paper_id"],
-                        "query": _latest_user_text(messages),
+                        "query": _fake_retrieval_query(messages),
                     },
                 }
             if (
@@ -179,6 +180,8 @@ def _call_fake_llm(messages: list[dict], tools: list[dict]) -> dict:
                     f"找到 {result['count']} 个相关片段，"
                     f"位于第 {page_text} 页。"
                 )
+            elif result.get("rejected_low_query_coverage"):
+                answer = "查询词在论文中的覆盖不足，暂时没有足够的关键词证据。"
             else:
                 answer = "有界关键词检索没有找到匹配段落。"
         elif (
@@ -237,7 +240,7 @@ def _call_fake_llm(messages: list[dict], tools: list[dict]) -> dict:
                 "tool_name": "retrieve_paper_chunks",
                 "tool_arguments": {
                     "paper_id": download_result["paper_id"],
-                    "query": _latest_user_text(messages),
+                    "query": _fake_retrieval_query(messages),
                 },
             }
 
@@ -354,6 +357,34 @@ def _latest_user_text(messages: list[dict]) -> str:
         ),
         "",
     )
+
+
+def _fake_retrieval_query(messages: list[dict]) -> str:
+    """Extract a deterministic content query for Fake LLM flow tests."""
+    user_text = _latest_user_text(messages)
+    english_terms = re.findall(
+        r"[A-Za-z0-9]+(?:[-_./][A-Za-z0-9]+)*",
+        user_text,
+    )
+    if english_terms:
+        return " ".join(english_terms)
+
+    query = user_text
+    for phrase in (
+        "请搜索",
+        "请下载",
+        "并回答",
+        "哪一页",
+        "在哪里",
+        "在哪",
+        "查找",
+        "检索",
+        "回答",
+        "搜索",
+        "下载",
+    ):
+        query = query.replace(phrase, " ")
+    return query.strip(" ，。！？?：:") or user_text
 
 
 def _latest_successful_download(messages: list[dict]) -> dict | None:

@@ -61,13 +61,15 @@ download_paper, a concise lexical query, and optional top_k. For an English
 paper, include likely English technical terms even when the user asks in
 another language. Never pass a local path. If there is no download_paper
 result, follow the same download authorization rule described above.
-When retrieval returns no matches, say that the bounded lexical search found
-no matching passage; do not invent an answer from the paper. Inspect
-coverage_complete, page_count, page_numbers, and source_truncated before
-describing the search scope. Only say that the complete PDF was searched when
-coverage_complete is true; otherwise disclose the index truncation reasons.
-index_status only describes whether the local index was built, reused, or
-rebuilt and is not evidence about the paper itself.
+When retrieval returns no matches, do not invent an answer from the paper.
+Inspect rejected_low_query_coverage: when true, say that the available query
+terms provide insufficient lexical evidence and ask for or try more specific
+technical terms; otherwise say that no matching passage was found. Also
+inspect coverage_complete, page_count, page_numbers, and source_truncated
+before describing the search scope. Only say that the complete PDF was
+searched when coverage_complete is true; otherwise disclose the index
+truncation reasons. index_status only describes whether the local index was
+built, reused, or rebuilt and is not evidence about the paper itself.
 Return a final answer when the available information is sufficient.
 """.strip()
 

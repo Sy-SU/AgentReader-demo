@@ -424,6 +424,17 @@ def _tool_result_summary(tool_name: str, result: object) -> str:
             f"{result.get('char_count', 0)} 字符"
         )
     if tool_name == "retrieve_paper_chunks":
+        if result.get("rejected_low_query_coverage"):
+            coverage = result.get("query_term_coverage")
+            minimum = result.get("minimum_query_term_coverage")
+            if isinstance(coverage, (int, float)) and isinstance(
+                minimum, (int, float)
+            ):
+                return (
+                    "查询证据不足 · "
+                    f"查询词覆盖 {coverage:.0%} < {minimum:.0%}"
+                )
+            return "查询证据不足"
         pages = sorted(
             {
                 match.get("page")

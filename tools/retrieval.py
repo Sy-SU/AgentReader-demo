@@ -23,6 +23,16 @@ TOKEN_PATTERN = re.compile(
 )
 MAX_TOP_K = 5
 MAX_RETRIEVAL_QUERY_CHARS = 500
+TFIDF_SCORING_METHOD = "tfidf_cosine"
+BM25_SCORING_METHOD = "bm25"
+SUPPORTED_SCORING_METHODS = (
+    TFIDF_SCORING_METHOD,
+    BM25_SCORING_METHOD,
+)
+DEFAULT_SCORING_METHOD = TFIDF_SCORING_METHOD
+DEFAULT_MIN_QUERY_TERM_COVERAGE = 0.5
+BM25_K1 = 1.5
+BM25_B = 0.75
 
 
 def chunk_paper_text(
@@ -124,11 +134,17 @@ def rank_paper_chunks(
     chunk_result: dict,
     query: str,
     top_k: int = 3,
+    scoring_method: str = DEFAULT_SCORING_METHOD,
+    min_query_term_coverage: float = DEFAULT_MIN_QUERY_TERM_COVERAGE,
 ) -> dict:
-    """Rank chunks with deterministic TF-IDF cosine similarity."""
+    """Rank chunks deterministically and reject weak corpus evidence."""
     if not isinstance(chunk_result, dict):
         raise ValueError("chunk_result must be a dictionary.")
     normalized_query = _validate_retrieval_request(query, top_k)
+    _validate_ranking_settings(
+        scoring_method=scoring_method,
+        min_query_term_coverage=min_query_term_coverage,
+    )
 
     paper_id = chunk_result.get("paper_id")
     chunks = chunk_result.get("chunks")
@@ -139,41 +155,35 @@ def rank_paper_chunks(
     _validate_chunks(chunks=chunks, paper_id=paper_id.strip())
 
     query_terms = _tokenize(normalized_query)
-
+    unique_query_terms = list(dict.fromkeys(query_terms))
     tokenized_chunks = [_tokenize(chunk["text"]) for chunk in chunks]
-    document_frequency = Counter()
-    for terms in tokenized_chunks:
-        document_frequency.update(set(terms))
+    corpus_terms = set().union(*(set(terms) for terms in tokenized_chunks))
+    matched_query_terms = [
+        term for term in unique_query_terms if term in corpus_terms
+    ]
+    query_term_coverage = len(matched_query_terms) / len(unique_query_terms)
+    rejected_low_query_coverage = (
+        query_term_coverage < min_query_term_coverage
+    )
 
-    document_count = len(chunks)
-    idf = {
-        term: math.log(
-            (document_count + 1) / (document_frequency[term] + 1)
-        )
-        + 1
-        for term in set(query_terms).union(document_frequency)
-    }
-    query_vector = _tfidf_vector(query_terms, idf)
-    query_norm = _vector_norm(query_vector)
+    if scoring_method == TFIDF_SCORING_METHOD:
+        scores = _tfidf_scores(tokenized_chunks, query_terms)
+    else:
+        scores = _bm25_scores(tokenized_chunks, query_terms)
 
     scored_chunks = []
-    unique_query_terms = list(dict.fromkeys(query_terms))
-    for chunk, terms in zip(chunks, tokenized_chunks, strict=True):
-        chunk_vector = _tfidf_vector(terms, idf)
-        chunk_norm = _vector_norm(chunk_vector)
-        if not chunk_norm:
-            continue
-
-        dot_product = sum(
-            query_vector.get(term, 0.0) * chunk_vector.get(term, 0.0)
-            for term in query_vector
-        )
-        score = dot_product / (query_norm * chunk_norm)
+    for chunk, terms, score in zip(
+        chunks,
+        tokenized_chunks,
+        scores,
+        strict=True,
+    ):
         if score <= 0:
             continue
 
+        chunk_terms = set(terms)
         matched_terms = [
-            term for term in unique_query_terms if term in chunk_vector
+            term for term in unique_query_terms if term in chunk_terms
         ]
         scored_chunks.append(
             {
@@ -192,7 +202,9 @@ def rank_paper_chunks(
             chunk["chunk_id"],
         )
     )
-    selected_chunks = scored_chunks[:top_k]
+    selected_chunks = (
+        [] if rejected_low_query_coverage else scored_chunks[:top_k]
+    )
     for chunk in selected_chunks:
         chunk.pop("_sort_score")
 
@@ -202,12 +214,18 @@ def rank_paper_chunks(
         "title": chunk_result.get("title"),
         "query": normalized_query,
         "query_terms": unique_query_terms,
-        "scoring_method": "tfidf_cosine",
+        "matched_query_terms": matched_query_terms,
+        "query_term_coverage": round(query_term_coverage, 6),
+        "minimum_query_term_coverage": min_query_term_coverage,
+        "rejected_low_query_coverage": rejected_low_query_coverage,
+        "scoring_method": scoring_method,
         "count": len(selected_chunks),
         "total_matches": len(scored_chunks),
         "total_chunks": len(chunks),
         "top_k": top_k,
-        "truncated": len(scored_chunks) > top_k,
+        "truncated": (
+            not rejected_low_query_coverage and len(scored_chunks) > top_k
+        ),
         "source_truncated": bool(chunk_result.get("source_truncated")),
         "source_truncation_reasons": list(
             chunk_result.get("source_truncation_reasons", [])
@@ -229,6 +247,8 @@ def retrieve_paper_chunks(
         chunk_result,
         query=query,
         top_k=top_k,
+        scoring_method=DEFAULT_SCORING_METHOD,
+        min_query_term_coverage=DEFAULT_MIN_QUERY_TERM_COVERAGE,
     )
     ranked_result["page_count"] = index_result["page_count"]
     ranked_result["pages_scanned"] = index_result["pages_scanned"]
@@ -348,6 +368,105 @@ def _is_cjk(value: str) -> bool:
         "\u3400" <= value[0] <= "\u4dbf"
         or "\u4e00" <= value[0] <= "\u9fff"
     )
+
+
+def _validate_ranking_settings(
+    scoring_method: str,
+    min_query_term_coverage: float,
+) -> None:
+    if scoring_method not in SUPPORTED_SCORING_METHODS:
+        supported = ", ".join(SUPPORTED_SCORING_METHODS)
+        raise ValueError(f"scoring_method must be one of: {supported}.")
+    if (
+        isinstance(min_query_term_coverage, bool)
+        or not isinstance(min_query_term_coverage, (int, float))
+        or not 0 <= min_query_term_coverage <= 1
+    ):
+        raise ValueError(
+            "min_query_term_coverage must be a number from 0 to 1."
+        )
+
+
+def _tfidf_scores(
+    tokenized_chunks: list[list[str]],
+    query_terms: list[str],
+) -> list[float]:
+    document_frequency = Counter()
+    for terms in tokenized_chunks:
+        document_frequency.update(set(terms))
+
+    document_count = len(tokenized_chunks)
+    idf = {
+        term: math.log(
+            (document_count + 1) / (document_frequency[term] + 1)
+        )
+        + 1
+        for term in set(query_terms).union(document_frequency)
+    }
+    query_vector = _tfidf_vector(query_terms, idf)
+    query_norm = _vector_norm(query_vector)
+
+    scores = []
+    for terms in tokenized_chunks:
+        chunk_vector = _tfidf_vector(terms, idf)
+        chunk_norm = _vector_norm(chunk_vector)
+        if not chunk_norm:
+            scores.append(0.0)
+            continue
+        dot_product = sum(
+            query_vector.get(term, 0.0) * chunk_vector.get(term, 0.0)
+            for term in query_vector
+        )
+        scores.append(dot_product / (query_norm * chunk_norm))
+    return scores
+
+
+def _bm25_scores(
+    tokenized_chunks: list[list[str]],
+    query_terms: list[str],
+) -> list[float]:
+    document_count = len(tokenized_chunks)
+    if not document_count:
+        return []
+
+    document_frequency = Counter()
+    for terms in tokenized_chunks:
+        document_frequency.update(set(terms))
+    average_document_length = sum(
+        len(terms) for terms in tokenized_chunks
+    ) / document_count
+    if not average_document_length:
+        return [0.0] * document_count
+
+    unique_query_terms = list(dict.fromkeys(query_terms))
+    scores = []
+    for terms in tokenized_chunks:
+        term_frequency = Counter(terms)
+        length_normalization = BM25_K1 * (
+            1
+            - BM25_B
+            + BM25_B * len(terms) / average_document_length
+        )
+        score = 0.0
+        for term in unique_query_terms:
+            frequency = term_frequency[term]
+            if not frequency:
+                continue
+            inverse_document_frequency = math.log(
+                1
+                + (
+                    document_count
+                    - document_frequency[term]
+                    + 0.5
+                )
+                / (document_frequency[term] + 0.5)
+            )
+            score += inverse_document_frequency * (
+                frequency * (BM25_K1 + 1)
+                / (frequency + length_normalization)
+            )
+        scores.append(score)
+    return scores
 
 
 def _tfidf_vector(

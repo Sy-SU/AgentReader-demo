@@ -14,6 +14,7 @@ from tools.index import (
     MAX_INDEX_PAGES,
 )
 from tools.retrieval import (
+    BM25_SCORING_METHOD,
     chunk_paper_text,
     rank_paper_chunks,
 )
@@ -261,6 +262,56 @@ class PaperRankingTests(unittest.TestCase):
         self.assertIn("三维", result["query_terms"])
         self.assertIn("重建", result["matches"][0]["matched_terms"])
 
+    def test_bm25_ranks_the_chunk_matching_more_query_terms_first(self):
+        chunks = chunk_paper_text(
+            extraction_result(
+                "[Page 1]\nTransformer attention mechanism architecture.\n\n"
+                "[Page 2]\nAttention visualization results."
+            )
+        )
+
+        result = rank_paper_chunks(
+            chunks,
+            query="attention mechanism",
+            scoring_method=BM25_SCORING_METHOD,
+        )
+
+        self.assertTrue(result["found"])
+        self.assertEqual(result["scoring_method"], "bm25")
+        self.assertEqual(result["matches"][0]["page"], 1)
+        self.assertGreater(
+            result["matches"][0]["score"],
+            result["matches"][1]["score"],
+        )
+
+    def test_query_coverage_guard_rejects_a_weak_common_term_match(self):
+        chunks = chunk_paper_text(
+            extraction_result(
+                "[Page 1]\nA model uses positional encoding."
+            )
+        )
+
+        guarded = rank_paper_chunks(
+            chunks,
+            query="model deployment security",
+        )
+        raw = rank_paper_chunks(
+            chunks,
+            query="model deployment security",
+            min_query_term_coverage=0.0,
+        )
+
+        self.assertFalse(guarded["found"])
+        self.assertEqual(guarded["matched_query_terms"], ["model"])
+        self.assertEqual(guarded["query_term_coverage"], 0.333333)
+        self.assertEqual(guarded["minimum_query_term_coverage"], 0.5)
+        self.assertTrue(guarded["rejected_low_query_coverage"])
+        self.assertEqual(guarded["total_matches"], 1)
+        self.assertEqual(guarded["matches"], [])
+        self.assertFalse(guarded["truncated"])
+        self.assertTrue(raw["found"])
+        self.assertFalse(raw["rejected_low_query_coverage"])
+
     def test_no_matching_terms_returns_a_normal_empty_result(self):
         chunks = chunk_paper_text(
             extraction_result("[Page 1]\nAttention architecture")
@@ -313,6 +364,24 @@ class PaperRankingTests(unittest.TestCase):
             rank_paper_chunks(chunks, query="!!!")
         with self.assertRaisesRegex(ValueError, "top_k"):
             rank_paper_chunks(chunks, query="attention", top_k=6)
+        with self.assertRaisesRegex(ValueError, "scoring_method"):
+            rank_paper_chunks(
+                chunks,
+                query="attention",
+                scoring_method="unsupported",
+            )
+        with self.assertRaisesRegex(ValueError, "min_query_term_coverage"):
+            rank_paper_chunks(
+                chunks,
+                query="attention",
+                min_query_term_coverage=True,
+            )
+        with self.assertRaisesRegex(ValueError, "min_query_term_coverage"):
+            rank_paper_chunks(
+                chunks,
+                query="attention",
+                min_query_term_coverage=1.1,
+            )
 
         malformed = {**chunks, "chunks": [{"text": "attention"}]}
         with self.assertRaisesRegex(ValueError, "paper_id"):
@@ -470,6 +539,16 @@ class RetrievalToolTests(unittest.TestCase):
                 if "tool_call" in message
             ],
             ["search_paper", "download_paper", "retrieve_paper_chunks"],
+        )
+        retrieval_call = next(
+            message["tool_call"]
+            for message in state["messages"]
+            if message.get("tool_call", {}).get("name")
+            == "retrieve_paper_chunks"
+        )
+        self.assertEqual(
+            retrieval_call["arguments"]["query"],
+            "attention mechanism",
         )
         retrieval_result = state["messages"][6]["content"]
         self.assertTrue(retrieval_result["found"])

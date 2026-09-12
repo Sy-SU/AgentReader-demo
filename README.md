@@ -19,7 +19,7 @@ LLM 决策 -> Runtime 执行 Tool -> Tool Result 写回 State -> LLM 再决策
 - 已支持通过只读 `list_library` Tool 查看本地保存的论文。
 - 已支持从可信搜索或文献库结果下载 PDF，并进行有界本地缓存。
 - 已支持从可信缓存 PDF 中提取有页数和字符数上限的文本。
-- 已实现页码感知的 chunking 和可解释的 TF-IDF chunk 排序。
+- 已实现页码感知的 chunking，以及可比较的 TF-IDF/BM25 chunk 排序。
 - 已将 `retrieve_paper_chunks` 接入 Agent Loop，只把有界 top-k 相关片段交给模型。
 - V2.1 已实现懒加载的本地全文 JSON 索引；PDF 未变化时重复检索会复用索引。
 - Runtime 已阻止同一用户轮次内重复执行相同的搜索 query。
@@ -28,7 +28,8 @@ LLM 决策 -> Runtime 执行 Tool -> Tool Result 写回 State -> LLM 再决策
 - 已提供轻量交互式终端：实时显示 LLM/Tool 状态，支持输入历史、Slash Commands
   和无 ANSI 的 `--plain` 模式。
 - V2 已通过真实 arXiv、DeepSeek 和 PDF 的端到端验收，V2.0.1 的提取正确性与
-  交互式终端也已完成；V2.1 的全文覆盖已经接入，下一步建立检索质量评测基线。
+  交互式终端也已完成；V2.1 的全文覆盖、检索评测、资源测量和排序方法选择均已
+  完成。下一版本开始前先讨论并定义 V3 的单一目标。
 
 详细范围和信息流见：
 
@@ -130,6 +131,13 @@ python main.py --plain --debug
 python -m unittest discover -s tests -v
 ```
 
+运行固定检索质量评测（同样不会访问网络或模型）：
+
+```bash
+python evaluate_retrieval.py
+python evaluate_retrieval.py --json
+```
+
 显式运行真实搜索测试（会先请求 arXiv，失败或无结果时请求 Crossref）：
 
 ```bash
@@ -147,6 +155,16 @@ RUN_LIVE_LLM_TESTS=1 python -m unittest \
 在线测试会强制选择 DeepSeek，读取 `.env` 中的
 `DEEPSEEK_API_KEY` 和 `DEEPSEEK_MODEL`，不会受
 `LLM_PROVIDER` 当前值影响。
+
+本项目的完整验收会同时启用全部联网测试：
+
+```bash
+RUN_LIVE_ARXIV_TESTS=1 RUN_LIVE_LLM_TESTS=1 \
+  python -m unittest discover -s tests -v
+```
+
+环境变量开关仍然保留，使普通离线开发或没有 API Key 的 CI 不会意外访问网络和
+产生模型费用；Codex 后续进行完整验收时使用上面的联网命令。
 
 正常运行 `python main.py` 时，`search_paper` 会优先查询 arXiv；
 只有 arXiv 超时、报错或无结果时，才会查询 Crossref。可选设置
@@ -275,17 +293,22 @@ chunk 最多 1200 个字符，相邻 chunk 重叠 200 个字符；chunk 不跨�
 `paper_id`、页码、页内字符起止位置和稳定 `chunk_id`。输入已经截断时，结果也会
 保留 `source_truncated` 和原始截断原因。
 
-`rank_paper_chunks` 会把查询和 chunks 转成 TF-IDF 向量，再用余弦相似度排序。
-英文按不区分大小写的单词切分，连续中文使用双字片段；默认只返回 3 个匹配，
-最多返回 5 个。没有共同检索词时返回正常空结果。同分时按页码、页内位置和
-`chunk_id` 排序，因此结果可重复。
+`rank_paper_chunks` 支持 TF-IDF 余弦相似度和 BM25 两种确定性排序方法。英文按
+不区分大小写的单词切分，连续中文使用双字片段；默认只返回 3 个匹配，最多返回
+5 个。同分时按页码、页内位置和 `chunk_id` 排序，因此结果可重复。
+
+正式 Tool 仍使用 TF-IDF，并增加独立的最低证据门槛：查询中至少 50% 的不同词项
+必须在整篇索引中出现，才返回排名片段。门槛不足时返回 `found=false`，同时用
+`query_term_coverage`、`matched_query_terms` 和
+`rejected_low_query_coverage=true` 说明原因；`total_matches` 仍保留门槛前的弱
+匹配数量，便于 Debug。这避免只因 `model` 等一个通用词碰巧出现就给出无依据答案。
 
 模型可见的 `retrieve_paper_chunks` 会在第一次查询时自动建立本地全文索引：
 
 ```text
 可信下载结果 → 校验 PDF SHA-256 与索引版本
 → 缺失/过期/损坏时建立索引 → 页内 chunking
-→ TF-IDF 排序 → 只返回 top-k 匹配片段
+→ TF-IDF 排序 + 查询词覆盖门槛 → 只返回 top-k 匹配片段
 ```
 
 索引默认保存在 `data/indexes/`，可以通过 `PAPER_INDEX_DIR` 修改位置。索引最多
@@ -298,7 +321,7 @@ State，模型只看到 top-k 片段、页码、覆盖状态和 `built/cached/re
 模型只能提交之前 `download_paper` 返回的 `paper_id`、最长 500 字符的检索 query
 和可选 `top_k`；Runtime 恢复可信本地路径，模型不能传入路径。默认返回 3 段，
 最多 5 段，全部 chunks 和连续提取文本都只存在于 Tool 内部，不写入 State。
-没有匹配词时返回正常的 `found=false`，不会拿无关首段凑答案。
+没有匹配词或查询词证据不足时返回正常的 `found=false`，不会拿无关首段凑答案。
 
 可以在一个请求中测试完整链路：
 
@@ -310,10 +333,70 @@ State，模型只看到 top-k 片段、页码、覆盖状态和 `built/cached/re
 出现在原文中的英文术语。当前检索可以覆盖索引范围内的完整 PDF，但仍是词法
 匹配，不是全文语义检索；中文问题和英文原文之间不会自动建立跨语言语义对应。
 
-这里的 State 是当前会话保存的完整消息历史；Context 是每次调用模型时实际发送
-的 instructions、历史消息和本次 Tool Result。检索 Tool 通过只产生少量 top-k
-结果来限制新增 Context，但本项目还没有跨会话长期 Memory、向量索引或完整 RAG。
-`--debug` 对每个匹配片段也只显示最多 400 字符预览。
+这里的 State 是当前 CLI 进程、当前会话保存的完整消息历史，退出程序后就会清空；
+Context 是每次调用模型时实际发送的 instructions、历史消息和本次 Tool Result。
+磁盘上的文献库、PDF 和全文索引可以跨会话复用，但它们不会自动注入 State，因此
+不等于 Agent Memory。检索 Tool 通过只产生少量 top-k 结果来限制新增 Context，
+本项目还没有跨会话长期 Memory、向量索引或完整 RAG。`--debug` 对每个匹配片段
+也只显示最多 400 字符预览。
+
+## 离线检索质量评测
+
+`evals/retrieval_cases.json` 保存一份版本化、确定性的教学评测集：6 页英文正文和
+10 个问题，覆盖英文词法查询、多页证据、中文查询英文正文、零词项重叠和通用词
+误命中。`evaluate_retrieval.py` 直接复用正式的 `chunk_paper_index` 与
+`rank_paper_chunks`，但不经过 Agent、LLM、网络或磁盘索引缓存。
+
+正式默认的 TF-IDF + 50% 查询词覆盖门槛，Top-3 结果为：
+
+- Recall@3：0.875
+- Hit Rate@3：0.875
+- MRR：0.875
+- 无答案准确率：1.000
+
+7 个英文词法问题的 Recall@3、Hit Rate@3 和 MRR 均为 1.0。通用词 `model` 的
+无答案误命中已被覆盖率门槛拦截；剩余失败是中文“位置编码”无法直接匹配英文
+原文。测试会锁定这份确定性结果作为回归快照，任何有意的算法变化都要同步审查和
+更新；它不是生产质量达标证明。
+
+同一评测集的对比结果如下：
+
+| 配置 | Recall@3 | Hit Rate@3 | MRR | 无答案准确率 |
+|---|---:|---:|---:|---:|
+| 原始 TF-IDF | 0.875 | 0.875 | 0.875 | 0.500 |
+| 原始 BM25 | 0.875 | 0.875 | 0.875 | 0.500 |
+| TF-IDF + 门槛 | 0.875 | 0.875 | 0.875 | 1.000 |
+| BM25 + 门槛 | 0.875 | 0.875 | 0.875 | 1.000 |
+
+BM25 没有带来指标提升，所以生产默认保持改动更小的 TF-IDF + 门槛。跨语言失败
+需要查询翻译或语义匹配，而不是只更换词法打分公式；当前 Agent 会为英文论文生成
+英文检索词，但 V2.1 不增加 embedding/hybrid 依赖。运行方式：
+
+```bash
+python evaluate_retrieval.py
+python evaluate_retrieval.py --compare
+python evaluate_retrieval.py --compare --json
+python evaluate_retrieval.py --method bm25
+```
+
+## 检索资源测量
+
+运行确定性的合成 PDF 基准：
+
+```bash
+python measure_retrieval_resources.py
+python measure_retrieval_resources.py --json
+```
+
+默认在隔离临时目录中生成 12 页、每页约 3000 字符的 PDF，重复 5 次。首次检索
+包含 PDF 哈希、全文索引建立与写盘、chunking 和 TF-IDF 排序；缓存检索包含哈希、
+索引读取与校验、chunking 和排序。PDF 生成本身不计入时间，也不会写入个人缓存。
+
+2026-09-12 在当前开发机上的参考结果：首次检索中位数约 8.9 ms，缓存检索中位数
+约 1.4 ms；36,000 字符形成 37,196 B 索引和 36 个 chunks，top-3 Tool Result 为
+5,131 B，即索引大小的 13.79%。该载荷是与 `llm.py` 相同 JSON 序列化方式得到的
+“本次检索新增 Context”，不包含 system instructions、Tool Schemas、旧消息和
+模型 tokenizer 开销。时间是机器相关观测值，不作为跨机器测试阈值。
 
 PDF 提取功能依赖 `pypdf`。已有环境如尚未同步，可运行：
 

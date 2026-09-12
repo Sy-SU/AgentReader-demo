@@ -116,11 +116,23 @@ Tool 包通过 `tools/__init__.py` 暴露稳定公共接口，调用方继续使
 - `download.py`：校验可信 PDF URL，执行有界下载并管理本地缓存。
 - `extract.py`：再次校验缓存路径，并对可信 PDF 执行有界文本提取。
 - `index.py`：建立、校验、失效和原子写入持久化全文 JSON 索引。
-- `retrieval.py`：封装索引页 chunking 和确定性 TF-IDF 相关性排序。
+- `retrieval.py`：封装索引页 chunking、确定性 TF-IDF/BM25 排序和查询证据门槛。
 
 `search.py` 复用 `library.py` 的论文 ID 函数，使搜索返回的 `candidate_id` 与最终
 文献库 ID 始终遵循同一规则。包内文件可以协作，但 Agent 和 Runtime 只依赖
 `tools/__init__.py` 暴露的公共接口。
+
+### `evals/` 与评测命令
+
+- `evals/retrieval_cases.json` 保存版本化的逐页文本、查询、期望页码和标签。
+- `evals/retrieval.py` 校验数据集，构造与正式全文索引相同的内存结构，并直接复用
+  `chunk_paper_index` 和 `rank_paper_chunks`。
+- `evaluate_retrieval.py` 只是命令行入口，提供人类可读报告、`--json` 输出和
+  `--compare` 同数据集方法对比。
+- `evals/resources.py` 在隔离目录生成合成 PDF，测量首次检索、缓存检索、磁盘索引
+  和 top-k Tool Result；`measure_retrieval_resources.py` 是对应命令行入口。
+- 评测路径不进入 Runtime 或 Agent Loop，不调用 LLM、网络和磁盘索引缓存，也不
+  创建或恢复会话 State。资源基准只使用自己在临时目录创建的缓存。
 
 ## 3. 内部消息协议
 
@@ -484,7 +496,11 @@ messages。临时文本 Chunking 会验证结构页码与提取 metadata 一致�
     "title": str | None,
     "query": str,
     "query_terms": list[str],
-    "scoring_method": "tfidf_cosine",
+    "matched_query_terms": list[str],
+    "query_term_coverage": float,
+    "minimum_query_term_coverage": float,
+    "rejected_low_query_coverage": bool,
+    "scoring_method": "tfidf_cosine" | "bm25",
     "count": int,
     "total_matches": int,
     "total_chunks": int,
@@ -502,10 +518,15 @@ messages。临时文本 Chunking 会验证结构页码与提取 metadata 一致�
 }
 ```
 
-英文和数字按不区分大小写的 token 处理，连续中文拆为双字片段。词频使用 token
-在当前文本中的比例，IDF 使用 `ln((N+1)/(df+1))+1`，最后计算查询和 chunk
-向量的余弦相似度。只返回分数大于 0 的结果，默认 top 3、最多 top 5；同分时按
-页码、页内起点和 chunk ID 排序。无匹配是正常空结果，不会任意返回无关段落。
+英文和数字按不区分大小写的 token 处理，连续中文拆为双字片段。TF-IDF 的词频
+使用 token 在当前文本中的比例，IDF 为 `ln((N+1)/(df+1))+1`，最后计算查询和
+chunk 向量的余弦相似度。BM25 使用 `k1=1.5`、`b=0.75`，作为同数据集实验选项；
+两种方法的绝对分数不直接比较。
+
+排序之外还计算“整篇索引中出现的不同查询词数 / 不同查询词总数”。正式默认要求
+覆盖率至少 0.5；不足时保留门槛前的 `total_matches` 供诊断，但清空 `matches` 并
+返回 `found=false`。这个门槛解决弱通用词假阳性，不改变 chunk 间的排序。同分时
+仍按页码、页内起点和 chunk ID 排序。默认 top 3、最多 top 5。
 
 ### `retrieve_paper_chunks`
 
@@ -521,8 +542,9 @@ LLM 可见的输入：
 
 Runtime 只接受当前 State 以前成功下载过的 `paper_id`，从对应 Tool Result 恢复
 完整 `download_result`。query 去除首尾空白后最多 500 字符；模型不能提交
-`local_path`。Tool 内部固定执行：加载或懒建立持久化全文索引、页内切分、TF-IDF
-排序。输出沿用上面的排序结果，并补充：
+`local_path`。Tool 内部固定执行：加载或懒建立持久化全文索引、页内切分、默认
+TF-IDF 排序和 50% 查询词覆盖门槛。BM25 与门槛参数只留在内部评测接口，不暴露给
+模型，避免模型在一次调用中改变检索质量策略。输出沿用上面的排序结果，并补充：
 
 ```python
 {
@@ -545,15 +567,53 @@ Context。
 
 ## 6. State、Context、Memory 与 RAG
 
-- **State**：当前命令行会话里的 `user_query`、完整 messages 和累计 step。它让
-  后续轮次能引用先前候选和 Tool Result。
+- **State**：当前命令行进程、当前会话里的 `user_query`、完整 messages 和累计
+  step。它让后续轮次能引用先前候选和 Tool Result，退出 CLI 后即清空。
 - **Context**：某一次模型调用实际收到的 system instructions 加当前 messages。
   检索 Tool 限制的是新增到 Context 的结果大小，不会自动删除旧 State。
 - **长期 Memory**：跨任务保存并按需召回的信息；当前未实现。本地文献库是显式
-  JSON 数据，不会自动注入模型，因此也不等同于 Agent Memory。
+  JSON 数据，PDF 和全文索引是磁盘缓存；三者都不会自动注入模型，因此也不等同
+  于 Agent Memory。
 - **RAG**：先从外部知识中检索相关内容，再让模型据此生成答案的整体模式。当前
-  Tool 已有持久化全文索引和有界词法检索，但没有向量库、语义检索、Context
-  压缩或质量评测基线，所以仍不称为完整 RAG。
+  Tool 已有持久化全文索引、有界词法检索和离线质量基线，但没有向量库、语义
+  检索或 Context 压缩，所以仍不称为完整 RAG。
+
+离线评测的数据流与在线 Agent 路径分离：
+
+```text
+固定逐页 JSON → 数据契约校验 → 内存索引
+→ 正式 chunk_paper_index → 正式 rank_paper_chunks
+→ 逐问题页码判断 → Recall@K / Hit Rate@K / MRR / 无答案准确率
+```
+
+有答案问题中，Recall@K 是召回的期望页数占全部期望页数的比例，Hit Rate@K 表示
+至少命中一页，MRR 使用第一个正确 chunk 的倒数排名；无答案问题仅在没有返回任何
+匹配 chunk 时算正确。两类问题分开聚合，避免大量无答案样例扭曲召回指标。
+
+方法选择复用同一份数据和同一套正式函数：
+
+```text
+原始 TF-IDF ┐
+原始 BM25   ├→ 相同 10 问、相同 top_k → 比较四项指标 → 选择默认配置
+带门槛 TF-IDF ┤
+带门槛 BM25 ┘
+```
+
+选择优先级为 Recall@K、无答案准确率、Hit Rate@K、MRR；指标完全相同时保留改动
+和依赖更少的 TF-IDF。当前 BM25 与 TF-IDF 指标持平，50% 查询词覆盖门槛把无答案
+准确率从 0.500 提升到 1.000，因此默认选择 `tfidf_guarded`。
+
+资源测量的数据流是：
+
+```text
+临时合成 PDF → 首次 retrieve_paper_chunks → 建立并写入全文索引
+             → 再次 retrieve_paper_chunks → 复用并校验索引
+             → 汇总耗时、索引字节数和 Tool Result JSON 字节数
+```
+
+首次和缓存计时都包含 PDF SHA-256、chunking 和默认 TF-IDF 排序，因此衡量的是用户
+实际调用一次检索 Tool 的时间，而不是孤立的 JSON 读写速度。Context 指标只计算
+本次 Tool Result；完整模型 Context 还包含 instructions、Schemas 和历史消息。
 
 ## 7. 搜索和保存的信息流
 
@@ -643,7 +703,7 @@ Runtime 只计数和拒绝，不生成第二个 query。是否根据 `no_lexical
 用户针对已下载论文提出具体问题
 → LLM 只提交 paper_id + query + 可选 top_k
 → Runtime 从历史 download_paper 结果恢复可信 local_path
-→ Tool 校验或建立全文索引 → 页内 chunking → TF-IDF 排序
+→ Tool 校验或建立全文索引 → 页内 chunking → TF-IDF 排序 + 查询词覆盖门槛
 → 只有 top-k 片段、页码和截断信息写回 State
 → 下一次 LLM 调用把这份小结果放入 Context 并生成答案
 ```
@@ -688,6 +748,8 @@ Runtime 只计数和拒绝，不生成第二个 query。是否根据 `no_lexical
 - 检索 ID 没有对应的可信下载结果：Runtime 返回 `unknown_download`，不读取文件。
 - 检索 query、`top_k` 越界或模型提交路径：Runtime 返回结构化 Tool 错误。
 - 检索没有共同词：正常 Tool Result，`found=false`，不返回任意无关段落。
+- 检索只命中不足 50% 的不同查询词：正常 Tool Result，
+  `rejected_low_query_coverage=true`，终端和 Agent 将其描述为证据不足。
 - 索引缺失：正常建立；PDF 变化或索引损坏/过期：自动原子重建。
 - 索引超过 200 页、200 万字符或 32 MiB：有界停止或拒绝写入，并披露截断/错误。
 - PDF 缓存路径越界、PDF 加密或损坏：Runtime 返回 `tool_execution_error`。
@@ -726,14 +788,14 @@ PDF 下载、缓存、有界文本提取、最小段落检索、候选本地重�
 模型可见页数元数据，并通过 UI 无关事件把同一个 Runtime 接入增强终端和 Plain
 终端；Agent 的决策和 Tool 执行边界没有改变。
 
-V2.1 的全文覆盖已经完成，下一步不直接引入高级 Agent 框架，而是建立质量基线：
+V2.1 的全文覆盖、质量评测、资源测量和算法选择已经完成。固定 10 问默认 Top-3 为
+Recall@3=0.875、Hit Rate@3=0.875、MRR=0.875、无答案准确率=1.000。BM25 与
+TF-IDF 持平；50% 查询词覆盖门槛消除了固定集中的通用词无答案误命中，剩余失败是
+中文查询无法直接召回英文正文。接下来仍不直接引入高级 Agent 框架：
 
 ```text
-1. 建立固定论文、问题和期望页码组成的评测集
-2. 计算 Recall@K、MRR 和无答案查询行为
-3. 记录建索引/缓存命中的时延、磁盘和 Context 大小
-4. 用同一评测集比较 TF-IDF 与 BM25
-5. 验收 V2.1 后，再判断是否需要 embedding、Planning、Memory 或 Graph
+1. 根据真实使用问题为 V3 选择一个能力，而不是一次加入全部高级能力
+2. 在开发前记录该能力的目标、非目标、信息流和验收标准
 ```
 
 开发和复盘方法见 `docs/agent-development-process.md`。

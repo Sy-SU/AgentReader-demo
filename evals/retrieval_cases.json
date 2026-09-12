@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "description": "Deterministic transformer-concept retrieval baseline.",
+  "paper": {
+    "paper_id": "eval:transformer-concepts-v1",
+    "title": "Transformer Concepts Evaluation Fixture",
+    "pages": [
+      {
+        "page": 1,
+        "text": "The proposed Transformer architecture replaces recurrent and convolutional sequence models with attention mechanisms. The encoder and decoder are constructed from stacked layers."
+      },
+      {
+        "page": 2,
+        "text": "Scaled dot-product attention computes query-key dot products, divides by the square root of the key dimension, applies softmax, and combines the values."
+      },
+      {
+        "page": 3,
+        "text": "Multi-head attention linearly projects queries, keys, and values into several representation subspaces. The heads operate in parallel and their outputs are concatenated."
+      },
+      {
+        "page": 4,
+        "text": "Sinusoidal positional encoding adds sine and cosine signals at different frequencies so the model can represent absolute and relative token positions."
+      },
+      {
+        "page": 5,
+        "text": "Training uses the Adam optimizer with a scheduled learning rate. The rate increases during warmup steps and then decreases with inverse square-root decay."
+      },
+      {
+        "page": 6,
+        "text": "Machine translation experiments report BLEU results on the WMT 2014 English-to-German and English-to-French benchmarks."
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "architecture",
+      "query": "Transformer recurrent convolutional architecture",
+      "expected_pages": [1],
+      "tags": ["lexical", "architecture"]
+    },
+    {
+      "id": "scaled-attention",
+      "query": "scaled dot-product attention query key softmax",
+      "expected_pages": [2],
+      "tags": ["lexical", "method"]
+    },
+    {
+      "id": "multi-head",
+      "query": "multi-head attention projections parallel heads",
+      "expected_pages": [3],
+      "tags": ["lexical", "method"]
+    },
+    {
+      "id": "positional-encoding",
+      "query": "sinusoidal positional encoding sine cosine",
+      "expected_pages": [4],
+      "tags": ["lexical", "method"]
+    },
+    {
+      "id": "training-schedule",
+      "query": "Adam optimizer warmup learning rate",
+      "expected_pages": [5],
+      "tags": ["lexical", "training"]
+    },
+    {
+      "id": "translation-results",
+      "query": "BLEU WMT 2014 English German French",
+      "expected_pages": [6],
+      "tags": ["lexical", "experiment"]
+    },
+    {
+      "id": "attention-overview",
+      "query": "attention mechanism",
+      "expected_pages": [1, 2, 3],
+      "tags": ["lexical", "multi-page"]
+    },
+    {
+      "id": "cross-language-position",
+      "query": "位置编码使用正弦和余弦",
+      "expected_pages": [4],
+      "tags": ["cross-language", "known-limitation"]
+    },
+    {
+      "id": "no-answer-zero-overlap",
+      "query": "database transaction isolation",
+      "expected_pages": [],
+      "tags": ["no-answer", "zero-overlap"]
+    },
+    {
+      "id": "no-answer-common-term",
+      "query": "model deployment security",
+      "expected_pages": [],
+      "tags": ["no-answer", "weak-overlap"]
+    }
+  ]
+}
