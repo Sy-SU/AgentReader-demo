@@ -3,6 +3,9 @@ channels:
   - conda-forge
 dependencies:
   - python=3.13
+  - pypdf>=6,<7
+  - prompt-toolkit>=3,<4
+  - rich>=14,<15
   - pip
   - pip:
       - openai==2.54.0

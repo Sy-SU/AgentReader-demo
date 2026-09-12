@@ -1,45 +1,45 @@
-# Agent 文献搜索与管理 Demo — TODO
+# AgentReader Demo — 开发路线
 
 ## 1. 项目目标
 
-通过“交互式教学 + 实战”的方式，从零实现一个最小可运行的文献搜索与管理 Agent。
-
-当前阶段重点不是直接使用 LangGraph、OpenAI Agents SDK 或 Multi-Agent 框架，而是先手写并理解 Agent 的基础机制：
+通过“交互式教学 + 实战”理解并实现文献 Agent 的基础机制：
 
 ```text
 Agent = LLM + Tools + Loop + State
 ```
 
-最终希望逐步完成：
+开发顺序保持为：
 
 ```text
 V1：最小 Agent Loop
     ↓
-V2：文献搜索 + PDF 阅读 + 文献管理 + RAG
+V2：真实搜索 + 文献阅读 + 文献管理 + 最小检索
+    ↓
+V2.0.1：提取正确性 + 交互式终端
+    ↓
+V2.1：全文覆盖 + 检索质量评测
     ↓
 V3：Planning + Memory + Graph / Multi-Agent
 ```
 
----
-
-## 2. 学习与实现原则
-
-- [ ] 先理解底层机制，再使用高级框架
-- [ ] 不一次性生成整个项目
-- [ ] 每次只实现一个小模块
-- [ ] 每段代码都要明确“为什么存在”
-- [ ] 每实现一个模块，都先验证再继续
-- [ ] 必要时通过小问题或选择题确认理解
-- [ ] 优先保证数据流清晰，而不是追求工程复杂度
-- [ ] V1 不提前加入 Planning、Memory、RAG、Graph、Multi-Agent、MCP
+当前状态：V1、V2 和 V2.0.1 已完成；V2.1 已完成全文索引，下一步建立检索质量
+评测基线。
 
 ---
 
-## 3. V1：最小 Agent Demo
+## 2. 开发原则
 
-### 3.1 V1 目标
+- 先理解底层机制，再考虑高级框架。
+- 每次只实现一个小步骤，并解释信息流和设计原因。
+- 每个步骤完成后运行相关测试。
+- 优先保证数据流清晰，避免提前抽象和过度工程化。
+- 不读取或提交 `.env`、API Key 和个人文献库。
 
-完成下面这条最小链路：
+---
+
+## 3. V1：最小 Agent Loop（已完成）
+
+### 核心链路
 
 ```text
 main
@@ -56,474 +56,232 @@ runtime
   ↓
 tool
   ↓
-tool_result
-  ↓
-state
+tool_result 写回 state
   ↓
 llm
   ↓
 final answer
 ```
 
-第一阶段甚至不接真实 LLM，而是使用 Fake / Mock LLM，先验证 Agent Loop 是否正确。
+### 已完成能力
 
-### 3.2 V1 最小功能
+- [x] `main.py` 接收用户输入并输出最终答案。
+- [x] `state.py` 使用普通 `dict` 保存 `user_query`、`messages` 和 `step`。
+- [x] `agent.py` 管理 instructions 和 allowed tools，不直接执行 Tool。
+- [x] `llm.py` 将不同 Provider 的输出归一为 `tool_call` 或 `final`。
+- [x] Fake LLM 可以离线、确定性地跑通完整 Agent Loop。
+- [x] Runtime 维护 Tool Registry，并根据工具名分发 Python 函数。
+- [x] Tool Result 会写回 messages，再交给 LLM 决策。
+- [x] `max_steps` 可以阻止无限循环。
+- [x] 未注册 Tool、参数绑定错误和 Tool 异常会转成结构化错误。
+- [x] Provider 特有响应解析只存在于 `llm.py`。
+- [x] `--debug` 可以显示 LLM 决策、Tool Call、Tool Result 和步数。
 
-- [ ] 用户输入一个文献相关请求
-- [ ] 创建当前任务 State
-- [ ] Agent 调用 LLM 接口
-- [ ] LLM 返回统一格式的 `tool_call` 或 `final`
-- [ ] Runtime 根据工具名查找 Tool Registry
-- [ ] Runtime 执行 Tool
-- [ ] Tool 返回结构化结果
-- [ ] Tool Result 写入 State / messages
-- [ ] Runtime 再次调用 LLM
-- [ ] LLM 最终返回 Final Answer
-- [ ] 设置 `max_steps`，避免无限循环
-- [ ] 对工具不存在、参数错误、工具异常进行基本处理
+### V1 需要持续保持的边界
 
----
-
-## 4. V1 项目结构
-
-```text
-agent_demo/
-├── main.py
-├── agent.py
-├── runtime.py
-├── state.py
-├── tools.py
-└── llm.py
-```
-
-### `main.py`
-
-职责：
-
-- [ ] 程序入口
-- [ ] 读取用户输入
-- [ ] 初始化 State
-- [ ] 创建 Agent / Runtime
-- [ ] 启动 Agent Loop
-- [ ] 输出最终结果
-
-### `state.py`
-
-第一版只使用普通 `dict`。
-
-```text
-state = {
-    user_query,
-    messages,
-    step
-}
-```
-
-职责：
-
-- [ ] 创建初始 State
-- [ ] 保存用户原始请求
-- [ ] 保存 Agent 执行历史
-- [ ] 保存当前 step
-
-暂不使用：
-
-- dataclass
-- TypedDict
-- Pydantic
-- 长期 Memory
-
-### `tools.py`
-
-第一版只实现少量、单一职责的 Tool。
-
-首个 Tool：
-
-```text
-search_paper(query)
-```
-
-建议输入：
-
-```text
-query: string
-```
-
-建议输出：
-
-```text
-{
-    found: true / false,
-    title: ...,
-    pdf_url: ...
-}
-```
-
-TODO：
-
-- [ ] 实现 `search_paper`
-- [ ] 保证输入结构化
-- [ ] 保证输出结构化
-- [ ] 区分正常业务失败和真正异常
-
-正常业务结果示例：
-
-```text
-{
-    found: false,
-    title: null,
-    pdf_url: null
-}
-```
-
-真正异常包括：
-
-- 网络超时
-- API Key 无效
-- 数据解析失败
-- 服务不可用
-
-后续再增加：
-
-- [ ] `read_paper`
-- [ ] `save_paper`
-- [ ] `list_library`
-
-### `llm.py`
-
-目标：屏蔽不同模型厂商 API 的差异。
-
-概念接口：
-
-```text
-call_llm(messages, tools)
-```
-
-统一返回：
-
-```text
-LLMResponse
-
-{
-    type: "final" | "tool_call",
-    content: string | null,
-    tool_name: string | null,
-    tool_arguments: dict | null
-}
-```
-
-Tool Call 示例：
-
-```text
-{
-    type: "tool_call",
-    content: null,
-    tool_name: "search_paper",
-    tool_arguments: {
-        query: "TASA"
-    }
-}
-```
-
-Final 示例：
-
-```text
-{
-    type: "final",
-    content: "...",
-    tool_name: null,
-    tool_arguments: null
-}
-```
-
-TODO：
-
-- [ ] 定义统一 LLMResponse
-- [ ] 实现 Fake / Mock LLM
-- [ ] 第一次调用固定返回 `search_paper("TASA")`
-- [ ] 第二次调用读取 Tool Result 后返回 Final Answer
-- [ ] 保证 Runtime 不依赖任何厂商特有字段
-
-以后再考虑：
-
-```text
-llm/
-├── base.py
-├── openai_adapter.py
-├── local_adapter.py
-└── mock_adapter.py
-```
-
-但 V1 不做这层工程化。
-
-### `agent.py`
-
-职责：
-
-- [ ] 定义 Agent instructions
-- [ ] 定义模型配置
-- [ ] 定义 allowed tools
-- [ ] 将 messages 和 Tool Schema 交给 `llm.py`
-- [ ] 返回统一 LLMResponse
-
-Agent 负责“决策接口”，不负责真正执行 Tool。
-
-### `runtime.py`
-
-Runtime 是 V1 中最关键的部分。
-
-职责：
-
-- [ ] 实现 Agent Loop
-- [ ] 维护 Tool Registry
-- [ ] 接收 Tool Call
-- [ ] 检查工具是否存在
-- [ ] 检查参数
-- [ ] 调用真实 Python Tool
-- [ ] 捕获工具异常
-- [ ] 将 Tool Result 写入 messages
-- [ ] 更新 `step`
-- [ ] 控制 `max_steps`
-- [ ] 在 Tool 执行后重新调用 LLM
-- [ ] 收到 `final` 后退出 Loop
-
-核心思想：
-
-```text
-LLM = 决策
-Runtime = 执行与约束
-Tool = 具体能力
-```
+- 不引入 LangGraph 或 OpenAI Agents SDK。
+- 不引入 Planning、长期 Memory、Graph 或 Multi-Agent。
+- 不把完整 RAG、Vector Database 或 MCP 塞进基础 Agent Loop。
+- Runtime 负责执行和约束，LLM 只负责提出下一步动作。
 
 ---
 
-## 5. V1 推荐实现顺序
+## 4. V2：已经完成的原型能力
 
-不要按照文件在目录中的顺序机械实现，而是按照依赖关系逐步搭建。
+### 真实文献搜索
 
-### Step 1：明确最小需求和数据流
+- [x] `search_paper(query)` 使用结构化输入和输出。
+- [x] 优先访问 `export.arxiv.org`。
+- [x] arXiv 不可用或没有结果时回退到 Crossref。
+- [x] 最多返回 3 篇候选论文。
+- [x] 返回统一论文 metadata。
+- [x] 区分“没有结果”和网络、解析、服务异常。
+- [x] Agent instructions 要求比较候选，信息不足时展示歧义。
+- [x] 默认测试 Mock 网络响应，不依赖外部服务。
+- [x] 真实搜索测试通过环境变量显式启用。
 
-- [ ] 明确用户输入是什么
-- [ ] 明确第一个 Tool 是什么
-- [ ] 明确 Tool Call 格式
-- [ ] 明确 Tool Result 格式
-- [ ] 明确 State 中最少需要保存什么
-- [ ] 画出一次完整 Agent Loop
+### 模型 Provider
 
-验收标准：能够不看代码，口头解释一次完整执行过程。
+- [x] 支持 Fake LLM。
+- [x] 支持 DeepSeek API。
+- [x] 兼容 OpenRouter 的 OpenAI 风格接口。
+- [x] 使用 Conda `environment.yml` 管理 Python 3.13 依赖。
+- [x] DeepSeek 在线 Agent Loop 测试通过环境变量显式启用。
 
-### Step 2：实现 `state.py`
+### 本地文献保存原型
 
-- [ ] 创建初始 State
-- [ ] 验证 `user_query / messages / step`
+- [x] 实现 `save_paper(paper)`。
+- [x] 默认保存到 `data/library.json`。
+- [x] 支持通过 `PAPER_LIBRARY_PATH` 修改保存位置。
+- [x] 使用 arXiv ID、DOI 或稳定哈希生成论文 ID。
+- [x] 对相同 arXiv ID 或 DOI 去重。
+- [x] 使用临时文件替换方式写入 JSON。
+- [x] 保存行为有离线测试，不污染真实个人文献库。
 
-验收标准：能够创建和打印一个完整初始 State。
+### 多轮命令行对话
 
-### Step 3：实现 `tools.py`
+- [x] Agent 每轮回答后继续等待用户输入。
+- [x] 后续消息追加到同一个 State，保留候选和 Tool Result。
+- [x] 用户可以回答“第 1 篇”来消除上一轮搜索歧义。
+- [x] `max_steps` 按每轮用户输入单独计数，同时保留累计 step。
+- [x] 空输入继续等待；支持 `/exit`、`exit`、`quit`、`退出` 或 EOF 结束会话。
+- [x] Debug Trace 每轮只显示本轮产生的新步骤。
 
-- [ ] 先实现一个假的 `search_paper`
-- [ ] 输入 `TASA`
-- [ ] 固定返回结构化论文信息
+### 用户触发的重新搜索
 
-验收标准：独立调用 Tool 能得到稳定、可序列化结果。
-
-### Step 4：实现 `llm.py`
-
-- [ ] 实现 Fake LLM
-- [ ] 第一次返回 Tool Call
-- [ ] 第二次返回 Final
-
-验收标准：Fake LLM 的输出完全符合统一 LLMResponse 格式。
-
-### Step 5：实现 `agent.py`
-
-- [ ] 定义 instructions
-- [ ] 定义 allowed tools
-- [ ] 将 Tool Schema 传给 LLM
-- [ ] 返回 LLMResponse
-
-验收标准：Agent 层不执行 Tool，也不包含 Runtime 逻辑。
-
-### Step 6：实现 `runtime.py`
-
-- [ ] 建立 Tool Registry
-- [ ] 实现 Tool dispatch
-- [ ] 实现最小 Loop
-- [ ] Tool Result 写回 State
-- [ ] 实现 `max_steps`
-- [ ] 实现最小错误处理
-
-验收标准：Fake LLM + Fake Tool 可以完整跑通一次 Agent Loop。
-
-### Step 7：实现 `main.py`
-
-- [ ] 接收用户输入
-- [ ] 创建 State
-- [ ] 启动 Runtime
-- [ ] 打印 Final Answer
-
-验收标准：可以从命令行完整运行 V1 Demo。
-
-### Step 8：理解验证
-
-确认可以解释：
-
-- [ ] 为什么 LLM 不能直接调用 Python 函数
-- [ ] Tool Schema 与 Tool Registry 的关系
-- [ ] 为什么 Tool 执行后要再次调用 LLM
-- [ ] Agent 与固定 Workflow 的区别
-- [ ] 为什么 Runtime 负责 `max_steps` 和 retry
-- [ ] State 和 Memory 的区别
-- [ ] 为什么模型厂商差异要收敛到 `llm.py`
+- [x] 用户否定旧候选并提供新线索时，允许再次调用 `search_paper`。
+- [x] Agent instructions 要求新的 query 保留用户补充的领域信息。
+- [x] 要求模型每个响应最多提出一个 Tool Call。
+- [x] Provider 仍返回多个 Tool Calls 时，只取第一个进入串行 Agent Loop。
+- [x] query 包含明确 arXiv ID 时使用 `id_list` 定向查询。
+- [x] arXiv HTTP 429 时退避重试一次，并记录最终回退原因。
+- [x] 记录并拒绝同一轮内完全重复的 query。
+- [x] 提供最低词法相关性状态，并限制单轮搜索次数。
+- [x] 扩大初始候选池并根据标题、摘要做本地重排。
 
 ---
 
-## 6. V1 完成标准
+## 5. 可靠的保存边界（已完成）
 
-只有下面这些全部完成后，再进入 V2：
+当前已完成多轮澄清和保存目标的来源校验：用户可以继续选择上一轮候选，LLM
+只提交 `candidate_id`，Runtime 只接受当前任务中 `search_paper` 真正返回过的
+候选。Runtime 在调用存储函数前还会通过终端确认器展示确切目标；缺少确认器、
+直接回车或用户拒绝时都不会写入。
 
-- [ ] 不依赖任何 Agent 框架
-- [ ] Fake LLM 能正常工作
-- [ ] Tool Schema 与 Tool Registry 分离
-- [ ] Agent Loop 可正常结束
-- [ ] 每次 Tool Result 都进入 State
-- [ ] Tool 执行后由 LLM 重新决策
-- [ ] `max_steps` 可以阻止死循环
-- [ ] Tool 错误不会直接导致整个程序无控制崩溃
-- [ ] Runtime 不包含 OpenAI / Anthropic 等厂商特有解析逻辑
-- [ ] 能清楚解释整个数据流
-
----
-
-## 7. V2：文献搜索、阅读、管理与 RAG
-
-V1 完全跑通后再开始。
-
-目标：
+### 目标流程
 
 ```text
-最小 Agent Loop
+search_paper 返回可信候选
     ↓
-真实文献搜索
+LLM 只选择 candidate_id
     ↓
-论文读取
+Runtime 从历史 Tool Result 中解析对应论文
     ↓
-本地文献管理
+终端展示待保存论文并请求确认
     ↓
-RAG / Chunk Retrieval
+save_paper 写入本地文献库
 ```
 
-TODO：
+### 已完成
 
-- [ ] 将 Fake `search_paper` 替换成真实搜索能力
-- [ ] 增加 `read_paper`
-- [ ] 设计 PDF 文本存储方式
-- [ ] 长 PDF 不直接全部塞入 messages
-- [ ] 实现 chunking
-- [ ] 实现相关段落检索
-- [ ] 只把当前相关 chunks 放入 Context
-- [ ] 实现 `save_paper`
-- [ ] 实现 `list_library`
-- [ ] 定义最小文献 metadata
-- [ ] 区分 State、Memory、RAG、Context
+- [x] 为搜索候选定义稳定的 `candidate_id`。
+- [x] LLM 调用保存 Tool 时只提交 `candidate_id`，不复制整篇 metadata。
+- [x] Runtime 验证候选确实来自当前任务的历史搜索结果。
+- [x] 测试不存在的候选和复制整份 metadata 的非法调用。
+- [x] 在本地文件写入前增加明确的用户确认。
+- [x] 用户拒绝时，把结构化拒绝结果写回 State，让 LLM 正常收尾。
+- [x] 测试确认和拒绝流程。
 
-V2 暂时仍不要求 Multi-Agent。
+完成标准：模型不能凭空构造一篇论文并写入文献库，用户可以在写入前看到并
+确认确切目标。
 
 ---
 
-## 8. V3：高级 Agent 机制
+## 6. 当前及后续 V2 路线
 
-在 V2 已经具备真实文献研究能力后，再逐步增加高级机制。
+### Step 1：拆分 Tools 包（已完成）
 
-### Planning
+- [x] 创建 `tools/` 包。
+- [x] 将 Tool Schema、搜索实现和文献库实现分开。
+- [x] 通过 `tools/__init__.py` 保持稳定的公共导入接口。
+- [x] 只做结构重构，不同时改变行为。
 
-- [ ] Planner
-- [ ] Executor
-- [ ] 结构化 Plan
-- [ ] 必要时 Replan
+### Step 2：查看文献库（已完成）
 
-原则：不是每次 Tool Call 后都 Replan，只有计划明显失效时才重新规划。
+- [x] 实现只读的 `list_library` Tool。
+- [x] 支持列出已保存论文的最小 metadata。
+- [x] 默认返回最近 20 篇，单次最多返回 50 篇。
+- [x] 为不存在、空库和损坏 JSON 增加测试。
 
-### Memory
+### Step 3：读取论文（已完成）
 
-- [ ] 跨任务长期信息存储
-- [ ] 用户偏好
-- [ ] 已读论文
-- [ ] 文献状态
-- [ ] 长期研究上下文
+- [x] 实现受限的 PDF 下载和本地缓存。
+- [x] 明确文件大小、超时、保存路径和失败处理。
+- [x] 只接受当前 State 中搜索或文献库查询返回过的稳定 ID。
+- [x] Tool Result 不包含 PDF 二进制内容。
+- [x] 实现 PDF 文本提取。
+- [x] 只读取当前 State 中可信下载结果对应的缓存路径。
+- [x] 默认限制为开头 5 页和 12000 字符，硬上限为 10 页和 20000 字符。
+- [x] 用结构化结果区分空文本、页数截断和字符数截断。
+- [x] 加密、损坏 PDF 和越界路径返回结构化错误。
+- [x] 不把长论文全文直接放进 messages。
 
-### Graph
+### Step 4：最小段落检索（已完成）
 
-理解并实现：
+- [x] 实现按页切分的固定字符窗口 chunking。
+- [x] 为每个 chunk 保留稳定 ID、页码和页内字符区间。
+- [x] 限制 chunk 大小和 overlap，并继承源文本截断状态。
+- [x] 使用无外部依赖的 TF-IDF 余弦相似度进行相关性排序。
+- [x] 支持英文单词和中文双字片段，定义无匹配和确定性同分顺序。
+- [x] 默认只选 top 3，硬上限为 top 5。
+- [x] 注册 `retrieve_paper_chunks` Tool，只把相关 chunks 放入当前 Context。
+- [x] 明确区分 State、长期 Memory、RAG 和 Context。
 
-```text
-Graph = State + Node + Edge
-```
+概念边界：State 是当前命令行会话内保留的消息记录；Context 是一次模型调用实际
+接收的 instructions、历史消息和 Tool Result；长期 Memory 是跨任务保留并按需
+召回的信息，本项目尚未实现；RAG 是“检索外部知识后再生成”的整体模式。V2 的
+这一小步当时只有有界词法检索；V2.1 已增加持久化全文索引，但仍没有向量库、
+语义检索或跨会话 Memory，因此仍不称为完整 RAG。
 
-- [ ] Node
-- [ ] Edge
-- [ ] Conditional Edge
-- [ ] State transition
+### Step 5：搜索相关性边界（已完成）
 
-再考虑是否引入 LangGraph。
+- [x] 记录并拒绝同一轮内经过空白规范化后完全重复的 query；下一用户轮次重置。
+- [x] 搜索源最多取 10 个候选，基于标题和摘要做确定性词法重排。
+- [x] 返回词法得分、命中位置和原始来源排名，最终仍只向模型返回前 3 个。
+- [x] 精确标题命中优先于只包含完整标题短语的扩展标题。
+- [x] 用四种状态表达最低相关性信号，不把无词法匹配伪装成相关结果。
+- [x] 每个用户轮次最多执行 2 次不同搜索，第三次返回结构化错误。
+- [x] 搜索 Debug Trace 使用有界摘要预览，不让长结果遮住最终回答和下一轮提示。
 
-### Multi-Agent
+### Step 6：V2 端到端验收（已完成）
 
-可能的结构：
+- [x] 使用真实 arXiv + DeepSeek 检查一次强匹配搜索。
+- [x] 使用真实 arXiv + DeepSeek 检查一次弱匹配或无匹配后的澄清行为。
+- [x] 检查搜索、保存、下载、提取和段落检索的 Debug Trace 与文档一致。
+- [x] 汇总 V2 已知限制，并选择先改进全文检索再评估 V3。
 
-```text
-Orchestrator
-├── Research Agent
-├── Reader Agent
-├── Library Agent
-└── Writer Agent
-```
+### Step 7：V2.0.1 提取正确性与交互式终端（已完成）
 
-TODO：
-
-- [ ] 明确每个 Agent 的职责边界
-- [ ] 为不同 Agent 设置最小 Tool 权限
-- [ ] Agent 间使用结构化 Schema 通信
-- [ ] 区分 Agent 与 Tool
-- [ ] 再决定是否需要真正的 Multi-Agent
+- [x] 区分 PDF 的 `pages_scanned`、`pages_read`、`page_numbers` 和部分页状态。
+- [x] 防止 PDF 正文中的 `[Page N]` 伪造结构页码，并校验提取 metadata。
+- [x] 为字符边界、空白页、部分页和伪造页码增加回归测试。
+- [x] Runtime 通过可选只读事件回调暴露 LLM/Tool 生命周期。
+- [x] 隔离事件观察者异常和可变数据，避免 UI 改变 Agent 执行。
+- [x] LLM 或 Tool 被中断时补齐内部消息协议，安全结束当前轮。
+- [x] 实现 Prompt Toolkit + Rich 增强终端和无 ANSI 的 `--plain` 模式。
+- [x] 支持进程内历史、`/help`、`/debug`、`/clear`、`/exit`。
+- [x] Slash Commands 不进入 State；非交互失败返回非零状态码。
+- [x] 完成 Plain 管道、真实 TTY 和真实 arXiv + DeepSeek + PDF 系统测试。
 
 ---
 
-## 9. 当前明确不做的内容
+## 7. V2.1：全文覆盖与检索质量（进行中）
 
-在 V1 阶段，以下内容全部暂缓：
+- [x] 选择首次检索时自动建立的持久化本地 JSON 索引。
+- [x] 使用索引格式版本、PDF SHA-256 和提取上限判断缓存是否有效。
+- [x] PDF 变化、索引损坏或契约过期时自动原子重建。
+- [x] 限制为最多 200 页、200 万字符和 32 MiB 索引文件。
+- [x] 保持 `retrieve_paper_chunks` 模型接口不变，只返回 top-k 片段。
+- [x] 暂时保持 TF-IDF，先把全文覆盖与排序算法升级分开。
+- [ ] 建立固定论文与问题组成的检索质量评测集。
+- [ ] 定义 Recall@K、MRR、无答案问题和中英文查询的验收阈值。
+- [ ] 测量首次建索引与缓存命中的时延、磁盘占用和 Context 大小。
+- [ ] 在同一评测集上比较 TF-IDF 与 BM25，再决定是否需要 embedding/hybrid。
+- [ ] 每个里程碑同步更新 `docs/agent-development-process.md`。
 
-- [ ] LangGraph
-- [ ] OpenAI Agents SDK
-- [ ] Multi-Agent
+---
+
+## 8. V3：当前不做
+
 - [ ] Planner / Replanner
 - [ ] 长期 Memory
-- [ ] 完整 RAG
-- [ ] Vector Database
+- [ ] Graph / LangGraph
+- [ ] Multi-Agent
 - [ ] MCP
-- [ ] 复杂异步执行
+- [ ] Vector Database
 - [ ] 并发 Tool Calling
+- [ ] 复杂异步执行
 - [ ] 复杂权限系统
-- [ ] 复杂 Pydantic Schema
-- [ ] Provider Adapter 抽象层级过度工程化
+- [ ] 过度抽象的 Provider Adapter
 
-原则：只有当前一层机制完全理解并跑通后，才增加下一层复杂度。
-
----
-
-## 10. 当前下一步
-
-从这里继续实战：
-
-- [ ] 明确 V1 文献 Agent 的最小用户需求
-- [ ] 确定 V1 第一版 Tool 数量
-- [ ] 确定一次完整的数据流
-- [ ] 开始实现 `state.py`
-
-当前建议只保留一个 Tool：
-
-```text
-search_paper
-```
-
-并使用 Fake LLM + Fake Search Tool 跑通第一条 Agent Loop。
+只有 V2.1 的检索质量、Context 控制和评测基线稳定后，再逐项评估这些能力。

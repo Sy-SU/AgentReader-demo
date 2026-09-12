@@ -4,3 +4,6 @@ __pycache__/
 .vscode/
 .env
 .DS_Store
+data/library.json
+data/pdfs/
+data/indexes/
