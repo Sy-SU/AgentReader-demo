@@ -443,9 +443,10 @@ conversation ID、step、tool name、duration、result status、retry count、to
   汇总；
 - 文献库和 PDF 缓存的临时文件策略尚未为多进程并发写入设计锁或唯一临时名；
 - PDF URL 检查拒绝显式私有 IP，但真实系统还要处理 DNS 解析和重绑定风险；
-- 当前所有 V2 工作仍位于相对 `V1` 提交的未提交工作区，缺少阶段性提交记录。
+- V1、V2 和 V2.1 已形成独立提交；后续版本仍应保持小而可回滚的阶段提交。
 
-优先级建议：先解决全文覆盖、质量评测、Context 预算和契约一致性，再评估复杂编排。
+V2.1 已完成全文覆盖和检索评测。下一阶段优先建立显式任务状态、预算和恢复边界，
+再评估长期 Memory、Graph 或 Multi-Agent。
 
 ## 6. 可复用检查清单
 
@@ -578,26 +579,76 @@ conversation ID、step、tool name、duration、result status、retry count、to
   被门槛拦截；正常终端解释证据不足；联网 arXiv 与 DeepSeek 完整测试不跳过。
 - **测试证据**：107 项联网完整回归全部通过，没有跳过；真实 15 页 PDF 的查询词
   覆盖率为 1.0，首次建立索引后再次检索命中缓存并召回第 9、12 页。
-- **下一小步**：V3 开始前先选择一个由真实任务暴露的问题，并完成阶段定义。
-- **暂定非目标**：Planning、长期 Memory、Graph 和 Multi-Agent。
+- **下一小步**：进入 V3，先实现 Plan 数据契约、验证器和状态转换测试。
+- **暂定非目标**：长期 Memory、Graph、Multi-Agent 和语义检索。
 - **排序升级门槛**：先得到 TF-IDF 基线，再在完全相同的评测集上比较 BM25；只有
   词法方案仍无法满足已定义问题时才评估 embedding/hybrid retrieval。
 
-### 7.5 V3：高级 Agent 能力
+### 7.5 V3：可恢复的单 Agent 计划执行器
 
-- **状态**：未开始。
-- **候选能力**：Planning/Replanning、长期 Memory、Graph 编排、并发 Tool Calling
-  或 Multi-Agent。
-- **原则**：不把候选能力一次性全部加入。每次只选择一个已经由 V2.1 真实任务暴露
-  出来的问题，并先定义不用该能力为什么无法可靠解决。
-- **进入门槛**：V2.1 检索质量有基线，Context 和 tracing 可测，核心 Tool 契约稳定。
-- **必须补充的真实工程问题**：持久任务、权限和租户隔离、成本预算、故障恢复、
-  observability、eval、部署和数据治理。
+- **状态**：Plan 纯数据层、Planner 输入边界、Runtime 可信 Plan 创建和最小 Executor
+  已经完成；Replan、blocked 与 Checkpoint 尚未接入。
+- **阶段目标**：让单 Agent 把多论文、多交付结果的用户目标拆成显式 Plan，串行执行
+  当前步骤，在有限条件下 Replan，并在进程退出后恢复同一个未完成任务。
+- **目标示例**：搜索两个方向的代表论文，下载 PDF，分别检索方法与实验结果，再
+  输出带论文和页码证据的比较。
+- **观察到的问题**：V2 Runtime 只对当前 LLM 决策做循环；复杂任务没有显式完成
+  条件、步骤进度和任务级预算，进程退出后 State 也无法恢复。
+- **信息流变化**：在用户目标与现有 Executor/Tool Loop 之间增加 Planner 和经过
+  Runtime 校验的 Plan；在每个重要状态转换后由独立 Checkpoint 层原子保存 State。
+- **保持不变**：`llm.py` 仍隔离 Provider 解析；Runtime 仍唯一执行 Tool 和修改可信
+  状态；每次只执行一个 Tool Call；保存仍逐篇确认；全文和索引不进入 Context。
+- **Plan 边界**：最多 8 步；模型只能提出高层步骤，不能伪造状态、计数器、URL、
+  路径、论文 ID 或 evidence reference。
+- **Replan 边界**：只在 Tool 失败、候选歧义、证据不足或前提失效时触发；最多 2
+  次，且必须保留完成步骤和可信证据，不重复副作用。
+- **任务预算**：累计最多 32 次 LLM 决策和 24 次 Tool 执行；达到上限后进入明确的
+  `blocked` 或 `failed`，不能无限循环。
+- **恢复边界**：第一版同一进程只有一个活动任务，Checkpoint 默认上限 4 MiB；
+  `--resume` 只恢复同一任务。完成、不可恢复失败或取消后清除活动 Checkpoint；新
+  任务不能静默覆盖尚未恢复的活动文件。
+- **关键概念**：Checkpoint 是 operational state persistence；长期 Memory 是新任务
+  中的选择性召回。V3 只实现前者，避免把“磁盘上有 JSON”误称为 Agent Memory。
+- **终端行为**：计划增加 `/plan`、`/cancel` 和 `--resume`；活动任务存在时 `/clear`
+  不得静默丢弃 Checkpoint。
+- **非目标**：LangGraph、Multi-Agent、MCP、长期 Memory、Embedding/Vector DB、
+  跨语言语义检索、并发 Tool Calling、后台任务和复杂异步调度。
+- **验收标准**：离线覆盖成功、非法 Plan、阻塞、有限 Replan、预算、取消、损坏
+  Checkpoint、恢复与幂等；真实 arXiv + DeepSeek + PDF 完成一个多论文任务，联网
+  测试不得跳过。
+- **实现顺序**：Plan 纯函数与状态机 → Planner/Fake → Runtime 单步执行 → Replan
+  与 blocked → Checkpoint → Terminal/Events → 离线评测 → 真实验收。
+- **Step 1 结果**：新增 `planning.py`，由 Runtime 输入原始目标和步骤描述后生成稳定
+  step ID；严格拒绝额外字段、非法状态、越界预算和不可信 evidence reference；状态
+  转换不原地修改旧 Plan。新增 13 项纯函数测试；启用真实 arXiv 与 DeepSeek 后，
+  全量 120 项回归全部通过，没有跳过。
+- **Planner 输入边界结果**：新增 `planner.py`，只在首次规划决策中临时提供内部
+  `submit_plan` Schema；模型只能提交 1–8 条步骤描述。Planner 将其归一为 `plan`
+  动作，普通 `tool_call|final` 保持不变，且 `submit_plan` 不进入 Tool Registry。
+  新增 8 项 Fake LLM/契约测试；真实 arXiv + DeepSeek 全量 128 项通过，无跳过。
+- **Runtime 创建结果**：第一次决策可以返回 `plan|tool_call|final`。Runtime 使用
+  最新用户消息与本地 UUID 创建 Plan，记录首次 LLM 用量，并在完整校验后同时更新
+  `State.task_id` 和 `State.plan`；`submit_plan` 不进入消息 Tool 协议。当前只返回
+  有界 Plan 预览，活动 Plan 不会被下一轮静默替换。新增 6 项 Runtime Planning 测试
+  和 1 项预算测试；真实 arXiv + DeepSeek 全量 135 项通过，无跳过。
+- **最小 Executor 结果**：新增 `executor.py`，只注入整体目标、已完成步骤和当前
+  running step，并继续使用现有串行 Tool Loop。Tool Result 获得 Runtime-owned
+  `tool-result-NNN` 引用，但不会直接完成 step；step-level final 才推进状态。Runtime
+  同时记录 LLM/Tool 预算并在调用前阻止越界。新增 2 项 Executor、4 项 Runtime
+  执行/预算和 1 项 evidence 转换测试；真实 arXiv + DeepSeek 全量 142 项通过，无
+  跳过。
+- **下一小步**：先提交当前 Plan/Planner/Executor 工作，再在单独分支升级 DeepSeek
+  thinking Tool Calling 消息协议；之后实现有限 Replan 与 blocked。
 
 ## 8. 更新记录
 
 | 日期 | 阶段 | 更新内容 | 证据 |
 |---|---|---|---|
+| 2026-09-12 | V3 最小 Executor | 当前 step 控制 Context、串行 Tool Loop、step-level final、可信 evidence 和执行前预算边界 | 7 项新增测试；真实 arXiv + DeepSeek 全量 142 项通过、无跳过 |
+| 2026-09-12 | V3 Runtime 创建 | 首次 Planner 决策创建 Runtime-owned task ID、Plan 和初始预算；简单任务保持 V2 路径 | 6 项 Runtime Planning + 1 项预算测试；真实 arXiv + DeepSeek 全量 135 项通过、无跳过 |
+| 2026-09-12 | V3 Planner 边界 | 增加内部 `submit_plan` Schema、规划 instructions 和三类初始动作归一化 | 8 项 Planner 测试；真实 arXiv + DeepSeek 全量 128 项通过、无跳过 |
+| 2026-09-12 | V3 Step 1 | 实现 Plan 纯数据契约、严格验证和不可变状态转换 | `planning.py`；13 项 Plan 测试；真实 arXiv + DeepSeek 全量 120 项通过、无跳过 |
+| 2026-09-12 | V3 需求定义 | 将 V3 收敛为单 Agent Planning、有限 Replanning 和同任务 Checkpoint 恢复 | 明确 Plan/状态/预算/权限/恢复边界、非目标、实现顺序和验收标准；基线提交 `0a1ed33` |
 | 2026-09-12 | V2.1 算法选择 | 同数据集比较 TF-IDF/BM25 与查询词覆盖门槛，默认采用 TF-IDF + 50% 门槛 | Recall/Hit/MRR=0.875；无答案准确率由 0.500 提升到 1.000；BM25 指标持平；107 项联网测试全部通过 |
 | 2026-09-12 | V2.1 资源测量 | 增加隔离合成 PDF 的首次/缓存检索、磁盘和 Context 载荷基准 | 首次约 8.9 ms；缓存约 1.4 ms；索引 37,196 B；结果 5,131 B |
 | 2026-09-12 | V2.1 检索评测 | 增加版本化 10 问离线评测、分标签结果和 JSON 报告，锁定 TF-IDF Top-3 基线 | Recall/Hit/MRR=0.875；无答案准确率=0.500；100 项测试，97 项通过、3 项跳过 |

@@ -780,7 +780,7 @@ Runtime 只计数和拒绝，不生成第二个 query。是否根据 `no_lexical
 - Prompt Toolkit 历史只保存在当前进程内，不会默认把用户输入写入磁盘。
 - 默认离线测试使用 Mock/Fake，不访问网络，也不写真实文献库。
 
-## 10. V2 验收与计划中的最小演进
+## 10. V2 验收与 V3 入口
 
 PDF 下载、缓存、有界文本提取、最小段落检索、候选本地重排、相关性状态和搜索
 次数边界均已接入 Agent Loop。V2 已使用真实 arXiv、DeepSeek 和 PDF 完成搜索、
@@ -791,11 +791,158 @@ PDF 下载、缓存、有界文本提取、最小段落检索、候选本地重�
 V2.1 的全文覆盖、质量评测、资源测量和算法选择已经完成。固定 10 问默认 Top-3 为
 Recall@3=0.875、Hit Rate@3=0.875、MRR=0.875、无答案准确率=1.000。BM25 与
 TF-IDF 持平；50% 查询词覆盖门槛消除了固定集中的通用词无答案误命中，剩余失败是
-中文查询无法直接召回英文正文。接下来仍不直接引入高级 Agent 框架：
+中文查询无法直接召回英文正文。V3 不直接引入高级 Agent 框架，而是在当前结构上
+增加可观察、可测试的计划控制层。
+
+## 11. V3 计划架构（最小 Executor 已实现）
+
+V3 的目标信息流是：
 
 ```text
-1. 根据真实使用问题为 V3 选择一个能力，而不是一次加入全部高级能力
-2. 在开发前记录该能力的目标、非目标、信息流和验收标准
+复合用户目标
+  ↓
+planner.py：生成或修订高层 Plan
+  ↓
+planning.py：校验契约与合法状态转换
+  ↓
+runtime.py：选择当前 step，调用现有 Executor/Tool Loop
+  ↓
+可信 Tool Result → evidence reference → Runtime 更新 step
+  ├─ 成功：进入下一 step
+  ├─ 前提失效：有限 Replan
+  ├─ 需要用户选择：blocked
+  └─ 完成：生成带证据最终回答
+  ↓
+checkpoint.py：每个重要状态转换后原子保存
+```
+
+### 11.1 计划模块职责
+
+- `planning.py`：已定义纯数据 Plan 契约、常量、验证器和状态转换；不调用模型、不
+  执行 Tool、不写文件，而且每次转换返回新的 Plan 值。
+- `planner.py`：已定义内部 `submit_plan` Schema、首次规划 instructions 和响应
+  归一化；后续再为已授权的 Replan 组装目标、当前 Plan 和必要结果摘要。它不直接
+  修改 State。
+- `executor.py`：已根据可信 Plan 组装任务目标、已完成步骤和当前 step 的有界控制
+  Context，并复用现有 Tool Schemas 请求一次 `tool_call|final`；不修改 State。
+- `checkpoint.py`：校验并原子保存/读取活动任务 Checkpoint；不知道 LLM 或 Tool。
+- `state.py`：已增加可为空的任务 ID 和 Plan；预算计数器与证据引用保存在 Plan 中。
+- `runtime.py`：已接入第一次 Planner 决策、可信 Plan 创建、串行 Executor、预算计数
+  和 evidence reference；后续仍负责 Replan 条件、Checkpoint 时机和副作用授权。
+- `main.py` / `terminal.py`：组合 `--resume`、`/plan`、`/cancel` 和事件显示，不修改
+  Plan 业务状态。
+
+Planner 使用仅供结构化输出的 `submit_plan` Schema。它不是外部 Tool，不进入
+`tools/` 包或 `TOOL_REGISTRY`，也不会被“执行”；`planner.py` 只读取归一化
+`tool_call.arguments`，随后由 `planning.py` 校验。这样可以复用 DeepSeek 与
+OpenRouter 已有 Tool Calling 协议，同时保持 Provider 解析仍只存在于 `llm.py`。
+
+新任务的第一次 LLM 决策可以在 `submit_plan`、现有外部 Tool Call 和 `final` 之间
+选择：复合任务提交高层步骤，简单任务保持 V2 路径。这避免额外调用一次分类模型，
+也不使用关键词硬编码路由。LLM 只提交步骤描述；Runtime 使用原始用户目标生成
+`task_id`、状态、revision、step ID、计数器和 evidence reference。活动 Plan 已经
+存在时，Runtime 只在满足 Replan 条件后才再次允许 `submit_plan`。
+
+当前 Planner 的归一化输出有三种：
+
+```python
+{"type": "plan", "tool_call_id": str, "step_descriptions": list[str], ...}
+{"type": "tool_call", ...}  # 简单任务沿用 V2
+{"type": "final", ...}      # 信息不足或无需 Tool
+```
+
+其中 `plan` 只携带经过 `planning.normalize_step_descriptions` 校验的步骤描述。
+Provider 返回的 `status`、`task_id`、预算、证据等额外参数会被拒绝；真正的 Plan
+仍要等 Runtime 使用原始用户目标和可信 task ID 调用 `create_plan` 后才产生。
+
+这条创建链路现已接入 Runtime：
+
+```text
+本轮最新 user message
+  + Planner 的 step_descriptions
+  + Runtime 生成的 UUID task_id
+  → create_plan
+  → record_plan_usage(llm_steps=1)
+  → 同时写入 State.task_id / State.plan
+```
+
+Runtime 在完整 Plan 创建并通过校验前不会部分更新 State。内部 `submit_plan` 调用
+不会作为 Assistant Tool Call 写进 messages，也不会触发 Tool Registry。创建后返回
+有界 Plan 预览；下一条用户消息进入下面的最小执行链路：
+
+```text
+start_next_step
+  → executor.py 注入 current step Context
+  → tool_call → Runtime 执行并写回 Tool Result
+  → Runtime 分配 tool-result-NNN evidence reference
+  → 继续当前 step
+  → step-level final → complete_current_step
+  → 有 pending step：继续串行执行；全部完成：任务 completed
+```
+
+Tool Call ID 来自 Provider，不能直接作为可信 evidence reference。Runtime 使用任务内
+单调递增的 `tool-result-NNN`，并把同一引用同时写入 Tool 消息和当前 step，因此后续
+可以反向定位真实 Tool Result。LLM 与 Tool 预算都在调用前检查，达到上限后任务进入
+`failed`，不会先产生第 33 次 LLM 调用或第 25 次 Tool 执行。
+
+### 11.2 计划状态
+
+```python
+{
+    "version": 1,
+    "task_id": str,
+    "goal": str,
+    "status": "running | blocked | completed | failed | cancelled",
+    "revision": int,
+    "current_step_id": str | None,
+    "steps": [
+        {
+            "id": str,
+            "description": str,
+            "status": "pending | running | completed | blocked | failed",
+            "attempts": int,
+            "evidence_refs": list[str],
+        }
+    ],
+    "budget": {
+        "llm_steps": int,
+        "tool_calls": int,
+        "replans": int,
+    },
+}
+```
+
+LLM 可以提出步骤内容，但不能写任务状态、attempts、预算和可信 evidence reference。
+这些字段由 Runtime 根据实际事件更新。证据引用指向 State 中已有的 Tool Result，
+Checkpoint 不复制 PDF、全文索引或 Tool 内部数据。
+
+步骤的正常转换是 `pending → running → completed|blocked|failed`。`blocked` 表示缺少
+继续执行所需的用户信息，因此只允许在用户补充信息后恢复为 `running`；恢复会增加
+一次 attempts。终态步骤不能由模型自行回退。
+
+### 11.3 Checkpoint 与 Memory 的边界
+
+```text
+Checkpoint = 恢复同一个未完成任务的精确运行状态
+Long-term Memory = 在新任务中选择性召回过去信息
+```
+
+V3 只实现前者。默认只存在一个 `data/checkpoints/active.json`，并设格式版本和
+4 MiB 上限。`--resume` 恢复前重新验证结构、可信 ID 与本地缓存；完成、不可恢复
+失败或明确取消后清除活动 Checkpoint。启动时存在活动文件就提示恢复，新任务不能
+静默覆盖它。任何 Checkpoint 内容都不会自动注入新的任务 Context。
+
+### 11.4 实现顺序
+
+```text
+Plan 纯数据契约与状态机
+→ Planner/Fake Planner
+→ Runtime 单步执行与预算
+→ 有限 Replanning / blocked
+→ Checkpoint 原子保存与恢复
+→ Terminal 命令和 Runtime Events
+→ 离线评测
+→ arXiv + DeepSeek + PDF 真实验收
 ```
 
 开发和复盘方法见 `docs/agent-development-process.md`。

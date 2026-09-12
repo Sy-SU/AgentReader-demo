@@ -19,11 +19,13 @@ V2.0.1：提取正确性 + 交互式终端
     ↓
 V2.1：全文覆盖 + 检索质量评测
     ↓
-V3：Planning + Memory + Graph / Multi-Agent
+V3：Planning + Replanning + Checkpoint
 ```
 
-当前状态：V1、V2、V2.0.1 和 V2.1 均已完成。V3 尚未开始；进入 V3 前先根据真实
-任务选择一个问题，并定义目标、非目标和验收标准。
+当前状态：V1、V2、V2.0.1 和 V2.1 均已完成。V3 已完成 Plan 纯数据层、Planner
+输入边界、Runtime 可信 Plan 创建和最小 step Executor；尚未接入 Replan、blocked
+或 Checkpoint。目标是让单 Agent 对多论文任务进行显式规划、有限重规划，并在
+进程退出后恢复同一任务。
 
 ---
 
@@ -279,17 +281,113 @@ save_paper 写入本地文献库
 
 ---
 
-## 8. V3：当前不做
+## 8. V3：可恢复的单 Agent 计划执行器（最小 Executor 已完成）
 
-- [ ] Planner / Replanner
-- [ ] 长期 Memory
-- [ ] Graph / LangGraph
-- [ ] Multi-Agent
-- [ ] MCP
-- [ ] Vector Database
-- [ ] 并发 Tool Calling
-- [ ] 复杂异步执行
-- [ ] 复杂权限系统
-- [ ] 过度抽象的 Provider Adapter
+目标任务示例：搜索两篇指定方向的代表论文，下载 PDF，分别检索方法和实验依据，
+最后给出带论文与页码证据的比较。V3 不改变已有 Tool 的可信 ID、人工确认和有界
+Context 原则。
 
-V2.1 已满足进入门槛。开始 V3 前仍需先选定一个真实问题，不一次性实现这些能力。
+### Step 1：Plan 数据契约和状态机
+
+- [x] 新增版本化 Plan 结构，包含任务目标、任务状态、revision 和有序 steps。
+- [x] 每个 step 包含稳定 ID、目标描述、状态、尝试次数和证据引用；不直接保存任意
+  URL、路径或模型伪造的 Tool Result。
+- [x] 支持 `pending → running → completed|blocked|failed`；用户补充必要信息后，
+  `blocked` 可恢复为 `running`。
+- [x] Plan 最多 8 步，所有转换返回新的已校验 Plan，不原地修改输入。
+- [x] 使用内部结构化 `submit_plan` 契约取得模型计划，不把它注册为外部 Tool。
+- [x] 独立 Planner 的初次模型决策可为复合任务选择 `submit_plan`，简单任务继续走现有
+  `tool_call|final`；避免再增加一次分类模型调用或脆弱的关键词路由。
+- [x] 为合法计划、非法结构、非法状态转换和越界步骤增加纯函数测试。
+
+### Step 2：Planner、Executor 与有限 Replanning
+
+- [x] Runtime 在没有活动 Plan 时使用 Planner 的首次决策，并从 `plan` 动作创建可信
+  Plan；普通 `tool_call|final` 保持 V2 路径。
+- [x] Runtime 独占 Plan 状态、任务预算和可信证据引用的写权限；模型返回的 Tool
+  Call ID 不会直接成为 evidence reference。
+- [ ] Planner 生成面向结果的高层步骤，不硬编码具体 Tool 调用序列。
+- [x] Executor 复用现有 Agent Loop，每次仍只执行一个 Tool Call。
+- [x] Runtime 启动第一个 pending step，将当前目标注入模型 Context；模型返回
+  step-level final 后才完成该 step，而不是把任意一次 Tool 成功直接当作完成。
+- [ ] Tool 失败、候选歧义或检索证据不足时才允许 Replan；普通成功步骤不重复规划。
+- [x] Runtime 记录任务级 LLM/Tool 用量，并在执行前阻止超过 32 次 LLM 决策或
+  24 次 Tool 执行。
+- [ ] 每个任务最多 Replan 2 次。
+- [ ] Replan 必须保留已完成步骤、可信结果和证据，不能重复有副作用的操作。
+- [ ] 缺少关键用户选择时进入 `blocked` 并请求澄清，不得由模型擅自补全。
+- [ ] 保存论文仍逐篇经过 `y/N` 确认；原始请求没有授权的副作用不能被 Plan 扩大。
+- [ ] 为成功、失败恢复、阻塞、预算耗尽和重复副作用增加 Runtime/Fake LLM 测试。
+
+当前最小 Executor 已打通 `pending → running → completed`：创建 Plan 后先返回预览，
+下一条用户消息开始执行；每次 Tool Result 在对应 Tool 消息和当前 step 中写入同一个
+Runtime-owned `tool-result-NNN` 引用，Tool 本身不会完成 step。多个 step 在同一个
+现有 Loop 内串行推进，step-level final 才触发完成；达到单轮 `max_steps` 时保留活动
+Plan，后续轮次可以继续。新增 2 项 Executor 测试、4 项 Runtime 执行/预算测试和
+1 项 evidence 转换测试；真实 arXiv + DeepSeek 全量 142 项通过，无跳过。
+
+### Step 2 前置：DeepSeek thinking 消息协议升级（单独分支）
+
+开始修改 thinking 协议前必须先完成以下 Git 边界，避免把已经完成的 Plan/Planner
+工作与 Provider 消息协议混在同一个提交中：
+
+- [ ] Codex 先提醒用户提交当前工作，不得直接开始修改 `llm.py`。
+- [ ] 用户完成提交后，检查 `git status` 确认工作区干净。
+- [ ] 从已提交的当前分支创建并切换到新分支，例如：
+  `git checkout -b feat/deepseek-thinking-protocol`。
+- [ ] 再次确认分支名和工作区状态，之后才能开始 thinking 协议修改。
+
+thinking 协议的实现范围：
+
+- [ ] 在 `llm.py` 中显式配置 thinking 开关和 reasoning effort，不依赖模型默认行为。
+- [ ] `_normalize_api_response()` 提取 Provider 返回的 `reasoning_content`，同时兼容
+  非 thinking 响应没有该字段的情况。
+- [ ] Runtime 将 `reasoning_content` 作为不透明 Assistant 消息字段写入 State；不
+  解析、不修改，也不将它当作文献证据。
+- [ ] `_to_api_messages()` 在带 Tool 的后续 DeepSeek 请求中原样回传对应
+  `reasoning_content`，保持 Tool Calling 消息协议完整。
+- [ ] 普通终端和 Debug 默认不显示 reasoning 内容；后续 Checkpoint 是否保存该字段
+  必须在实现恢复前单独评估大小、隐私和 Provider 兼容性。
+- [ ] 增加响应解析、消息序列化、thinking Tool Call 多轮回传、非 thinking 兼容和
+  OpenRouter 缺少或使用不同 reasoning 字段时的测试。
+- [ ] 完成后显式运行 DeepSeek 联网测试，不得把联网用例计为跳过，并同步更新
+  `docs/agent-development-process.md`。
+
+### Step 3：Checkpoint 与恢复
+
+- [ ] 同一进程只允许一个活动计划任务，使用稳定 `task_id` 标识。
+- [ ] 每次 Plan 或步骤状态变化后，将版本化 Checkpoint 原子写入
+  `data/checkpoints/active.json`；文件最大 4 MiB，并被 Git 忽略。
+- [ ] Checkpoint 不保存 API Key、PDF 二进制、全文索引或其他未进入 State 的数据。
+- [ ] `python main.py --resume` 校验并恢复 `running|blocked` 任务；损坏或过期结构
+  必须报错，不能静默覆盖。
+- [ ] Ctrl+C 或可恢复错误后保留可恢复 Checkpoint；任务完成、失败或明确取消后清除
+  活动 Checkpoint。Checkpoint 是同一任务恢复，不是跨任务长期 Memory。
+- [ ] 启动时若发现活动 Checkpoint，必须提示使用 `--resume`，不能由新任务静默覆盖。
+- [ ] 恢复时重新校验 PDF 缓存与可信 ID，已完成步骤不得再次执行。
+- [ ] 为写入中断、损坏文件、版本失效、超限、恢复和幂等行为增加测试。
+
+### Step 4：终端、事件与验收
+
+- [ ] 增加 `/plan` 查看当前计划，增加 `/cancel` 明确取消活动任务，并同步 `/help`。
+- [ ] 活动任务未取消时，`/clear` 不得静默丢弃其 Checkpoint。
+- [ ] 活动任务执行期间，普通用户消息只用于补充或澄清该任务；开始无关目标前必须
+  先完成或取消当前任务。
+- [ ] Runtime 增加 UI 无关的计划创建、步骤转换、Replan、Checkpoint 和阻塞事件；
+  Debug 输出保持有界。
+- [ ] 建立确定性的两篇论文规划评测，记录完成率、Replan 次数、LLM/Tool 步数和
+  Checkpoint 大小。
+- [ ] 使用真实 arXiv、DeepSeek 和 PDF 完成一次多论文端到端任务；完整联网测试
+  不得跳过。
+- [ ] 将实现、限制、测试结果和关键决策同步到全部项目文档。
+
+### V3 明确非目标
+
+- 不实现长期跨任务 Memory。
+- 不实现 Graph / LangGraph、Multi-Agent 或 MCP。
+- 不实现 Embedding、Vector Database 或跨语言语义检索。
+- 不实现并发 Tool Calling、后台任务或复杂异步调度。
+- 不重写现有 Provider Adapter 或已有检索算法。
+
+V3 完成后再根据实际评测决定下一项能力，而不是自动把所有高级 Agent 概念加入
+项目。

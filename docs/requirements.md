@@ -7,7 +7,8 @@
 
 当前版本定位：V1 最小 Agent Loop、V2 真实搜索/管理/阅读/最小检索、V2.0.1
 提取正确性和交互式终端，以及 V2.1 全文索引、离线评测、资源测量和排序方法选择
-均已完成。V3 尚未开始。
+均已完成。V3 已完成 Plan 纯数据层、Planner 输入边界、Runtime 可信 Plan 创建和
+最小 step Executor；Replan、blocked 与 Checkpoint 尚未实现。
 
 ## 2. 学习目标
 
@@ -286,6 +287,97 @@ pdf_url
 - 计时结果受机器和运行环境影响，只作参考观测，不得成为跨机器单元测试阈值；
   磁盘和载荷边界应通过结构性断言验证。
 
+### FR-16：V3 Plan 与 Planner 输入契约（已实现）
+
+- V3 面向需要多篇论文或多个交付结果的复合任务；简单搜索、保存或单篇问答继续
+  使用已经稳定的 V2 Agent Loop。
+- 新任务的第一次模型决策可以选择内部 `submit_plan`，不需要额外的关键词路由器；
+  简单任务仍可直接返回现有 `tool_call` 或 `final`。活动 Plan 存在时，不得再次创建
+  初始 Plan。
+- LLM 的 `submit_plan` 参数只能包含有序的高层步骤描述。Runtime 根据原始用户目标
+  创建版本化 Plan，并补充 `task_id`、任务 `status`、`revision`、稳定 step ID、
+  尝试次数和空证据引用。
+- 步骤描述不能被当作可信 URL、路径、论文 ID 或 Tool Result。
+- 任务状态只允许 `running|blocked|completed|failed|cancelled`；步骤状态只允许
+  `pending|running|completed|blocked|failed`。步骤可从 `blocked` 恢复到 `running`，
+  其余状态不能绕过 Runtime 任意回退；所有状态转换由 Runtime 校验和写入。
+- 单个 Plan 最多 8 步。模型返回非法字段、重复 step ID、非法状态或越界步骤时，
+  计划不得进入执行阶段。
+- `submit_plan` 是内部结构化输出契约；它不进入外部 Tool Registry、不计为 Tool
+  执行，也不产生外部副作用。Runtime 只允许它用于初始规划或已经授权的 Replan。
+
+当前 `planning.py` 已实现 Runtime 可调用的 `create_plan`、严格结构验证器和纯状态
+转换：输入 Plan 不被原地修改，非法字段、非法状态、越界计数器、不可信 evidence
+reference 和多个活动步骤都会在进入执行层前被拒绝。`planner.py` 已增加只包含
+`steps: list[str]` 的内部 `submit_plan` Schema，将其归一为 `type=plan` 动作；普通
+Tool Call 与 final 不变，而且该内部契约不在 Tool Registry。当前 Runtime 已能创建
+可信 Plan；Executor 的 step 启动与执行才是下一小步。Plan 与 Planner 边界完成时共
+21 项测试通过；启用真实 arXiv 与 DeepSeek 后，当时全量 128 项回归全部通过，没有
+跳过。
+
+### FR-17：V3 执行与有限 Replanning（最小 Executor 已实现）
+
+- Executor 必须复用现有串行 Agent Loop 和 Tool 安全边界，每次模型决策最多执行
+  一个 Tool Call。
+- Tool Result 由 Runtime 记录为当前步骤的可信 evidence reference，但不能直接完成
+  高层步骤；模型返回 step-level final 后才由 Runtime 完成当前步骤。模型不能直接
+  伪造完成状态、计数器或 evidence reference。
+- 只有 Tool 失败、候选歧义、检索证据不足或计划前提不成立时才允许 Replan。
+- 每个任务最多 Replan 2 次、累计最多 32 次 LLM 决策和 24 次 Tool 执行；达到任一
+  上限后必须进入 `failed` 或 `blocked`，不能继续循环。
+- Replan 必须保留已完成步骤和可信证据。已经成功完成或产生副作用的步骤不能仅因
+  新计划而重复执行。
+- 缺少论文选择、写入许可等关键用户输入时，任务必须进入 `blocked` 并请求澄清。
+- 原始目标只能授予其明确包含的动作；Planning 与恢复不能扩大下载或保存权限，
+  `save_paper` 仍须逐次人工确认。
+- 最终回答必须区分 `completed`、`blocked`、`failed` 和 `cancelled`，并只引用实际
+  Tool Result 中存在的论文与页码证据。
+
+当前 Runtime 已接入第一次 Planner 决策和最小 Executor。`plan` 动作只能包含
+Planner 规范化后的字段，Runtime 使用最新用户消息和本地 UUID 创建 Plan，将规划
+调用计为一次 `llm_steps`，再原子更新 State 中的 `task_id` 与 `plan`。创建后先显示
+有界 Plan；下一条用户消息启动第一个 pending step，`executor.py` 将任务目标、已完成
+步骤和当前 step 作为有界控制 Context 交给现有 Agent Loop。每次仍只执行一个 Tool
+Call；Runtime 为 Tool Result 分配 `tool-result-NNN` 引用并同时写入 Tool 消息与当前
+step。step-level final 才完成 step 并进入下一步。Runtime 在调用前阻止超过 32 次
+LLM 决策或 24 次 Tool 执行。Replan、blocked 与 Checkpoint 仍未接入。
+
+### FR-18：V3 Checkpoint 与恢复（计划需求，尚未实现）
+
+- 同一 CLI 进程同时只能有一个活动计划任务，并使用稳定 `task_id` 标识。
+- 每次 Plan 创建、步骤状态转换、Replan 或阻塞后，Runtime 必须写入版本化
+  Checkpoint。默认路径为 `data/checkpoints/active.json`，文件上限为 4 MiB。
+- Checkpoint 必须使用同目录唯一临时文件和原子替换；写入失败不能破坏上一份有效
+  Checkpoint。
+- Checkpoint 可以保存恢复任务所需的 State、Plan、计数器和可信结果，但不得包含
+  API Key、PDF 二进制、完整全文索引或 Tool 内部未返回的数据。
+- `python main.py --resume` 只恢复结构有效的 `running|blocked` 任务；损坏、超限或
+  版本不兼容必须给出明确错误，不能静默覆盖。
+- 恢复时必须重新校验缓存文件、稳定 ID 和已有 Tool Result。完成步骤不得重复执行，
+  未完成的写入操作不得被假定为已获授权。
+- Ctrl+C 和可恢复 Runtime 错误应保留活动 Checkpoint；任务完成或用户明确取消后
+  清除活动 Checkpoint。任务达到不可恢复的 `failed` 后也应清除活动文件，但先输出
+  有界诊断。
+- 程序启动时发现活动 Checkpoint，必须提示使用 `--resume`；新任务不能静默覆盖旧
+  Checkpoint。
+- Checkpoint 只用于恢复同一个任务，不会被自动召回到新任务，因此不是长期 Memory。
+
+### FR-19：V3 终端、事件与评测（计划需求，尚未实现）
+
+- `/plan` 必须以有界形式显示目标、revision、任务状态、当前步骤和各步骤状态；
+  `/cancel` 明确取消当前活动任务，并同步更新 `/help`。
+- 活动任务存在时，`/clear` 不得静默删除 Plan 或 Checkpoint；应提示先继续或取消。
+- 活动任务执行期间，普通用户消息只用于补充或澄清当前任务；开始无关任务前必须
+  先完成或 `/cancel` 当前任务。
+- Runtime Event 必须增加 UI 无关的计划创建、步骤转换、Replan、Checkpoint 保存和
+  任务阻塞事件；终端仍只是观察者，事件回调不能修改 Runtime 状态。
+- 离线测试必须覆盖两篇论文的成功流程、非法 Plan、歧义阻塞、Tool 失败后 Replan、
+  预算耗尽、取消、Checkpoint 损坏、进程恢复和副作用幂等。
+- 规划评测至少记录任务完成状态、Replan 次数、累计 LLM 决策、Tool 执行次数和
+  Checkpoint 字节数；这些数据必须与普通 Debug 文本分离，能够机器读取。
+- 最终验收必须显式启用真实 arXiv 与 DeepSeek，并使用真实 PDF 完成一次多论文、
+  多步骤、带页码证据的任务；联网用例不得计为跳过。
+
 ## 4. 状态需求
 
 V1 State 只保存当前任务需要的信息：
@@ -307,6 +399,12 @@ V1 State 只保存当前任务需要的信息：
 top-k 片段；旧消息仍保留在会话 State 中。本项目没有自动压缩 Context，也没有
 跨会话长期 Memory。
 
+V3 State 现已增加可为空的 `task_id` 和 `plan`；创建计划后，当前步骤、任务级预算
+和证据引用由 Plan 保存。后续 step 执行会填充这些字段。
+Checkpoint 是 State 的持久化快照；Context 仍是某一次模型调用选择发送的内容，
+二者不能混为一谈。Plan 与任务预算用于限制 Context 持续增长，但 V3 不实现跨任务
+语义召回或自动长期 Memory。
+
 ## 5. 配置和数据要求
 
 - 使用 Conda 和 `environment.yml` 管理 Python 3.13 环境。
@@ -314,6 +412,7 @@ top-k 片段；旧消息仍保留在会话 State 中。本项目没有自动压�
 - `.env` 保存本地 Provider 配置和 API Key，不提交到 Git。
 - `data/library.json` 是个人文献库数据，不提交到 Git。
 - `data/pdfs/` 和 `data/indexes/` 是可重新生成的本地缓存，不提交到 Git。
+- V3 的 `data/checkpoints/` 是可恢复的任务状态，不提交到 Git；实现前还不存在。
 - 默认离线测试不得访问真实模型或外部文献 API。
 - 在线测试必须通过环境变量显式启用。
 - 完整验收必须同时设置 `RUN_LIVE_ARXIV_TESTS=1` 和 `RUN_LIVE_LLM_TESTS=1`，实际
@@ -352,12 +451,12 @@ V2 端到端验收已完成：
 - 2026-09-12 联网完整验收运行 107 项测试，107 项全部通过，没有跳过。
 
 V2.1 已完成：BM25 没有改善当前数据集指标，最低查询词覆盖门槛解决了已知的通用
-词误命中，因此默认保留 TF-IDF + 50% 门槛。剩余跨语言失败不是更换词法评分公式
-能解决的问题；V2.1 不引入 embedding/hybrid。开始 V3 前必须先用真实任务选择一项
-能力并定义验收标准。
+词误命中，因此默认保留 TF-IDF + 50% 门槛。V3 已确定为显式 Planning、有限
+Replanning 和同任务 Checkpoint 恢复；当前已完成 Plan 纯数据层、Planner 输入边界
+和 Runtime 可信 Plan 创建，尚未执行 step 或接入 Checkpoint。
 
 ## 8. 当前非目标
 
-本阶段不实现 LangGraph、OpenAI Agents SDK、Planning、长期 Memory、Graph、
-Multi-Agent、MCP、Vector Database、完整 RAG、并发 Tool Calling 或复杂异步
-执行。
+V3 不实现 LangGraph、OpenAI Agents SDK、长期 Memory、Graph、Multi-Agent、
+MCP、Vector Database、完整 RAG、并发 Tool Calling 或复杂异步执行。跨语言语义
+检索也不与 Planning 同期实现。

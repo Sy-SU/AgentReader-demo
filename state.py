@@ -6,6 +6,8 @@ def create_state(user_query: str) -> dict:
             {"role": "user", "content": user_query},
         ],
         "step": 0,
+        "task_id": None,
+        "plan": None,
     }
 
 

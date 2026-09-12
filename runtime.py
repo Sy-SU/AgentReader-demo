@@ -2,9 +2,23 @@ import inspect
 from collections.abc import Callable
 from copy import deepcopy
 from time import perf_counter
+from uuid import uuid4
 
-from agent import decide_next_action
+from agent import decide_next_action as decide_agent_action
+from executor import decide_step_action as decide_plan_step
 from events import AgentEvent, EventHandler
+from planner import decide_initial_action
+from planning import (
+    MAX_TASK_LLM_STEPS,
+    MAX_TASK_TOOL_CALLS,
+    complete_current_step,
+    create_plan,
+    fail_plan,
+    record_current_step_evidence,
+    record_plan_usage,
+    start_next_step,
+    validate_plan,
+)
 from tools import (
     download_paper,
     extract_paper_text,
@@ -24,6 +38,13 @@ TOOL_REGISTRY = {
     "retrieve_paper_chunks": retrieve_paper_chunks,
 }
 MAX_SEARCH_ATTEMPTS_PER_TURN = 2
+
+
+def decide_next_action(state: dict, *, allow_planning: bool = False) -> dict:
+    """Route the first eligible decision through Planner, then use V2 Agent."""
+    if allow_planning:
+        return decide_initial_action(state)
+    return decide_agent_action(state)
 
 
 def execute_tool(
@@ -342,10 +363,41 @@ def run_agent(
     on_event: EventHandler | None = None,
 ) -> str:
     """Run one conversational turn until a final answer or the step limit."""
+    active_plan = _active_plan(state)
+    if active_plan is not None and active_plan["status"] == "blocked":
+        answer = _format_plan_answer(active_plan, created=False)
+        state["messages"].append({"role": "assistant", "content": answer})
+        _emit_event(
+            on_event,
+            {
+                "kind": "turn_finished",
+                "turn_step": 0,
+                "total_step": state["step"],
+                "status": "planned",
+            },
+        )
+        return answer
+    plan_execution = active_plan is not None
+
     steps_this_turn = 0
     search_queries_this_turn = set()
 
     while steps_this_turn < max_steps:
+        if (
+            plan_execution
+            and state["plan"]["budget"]["llm_steps"]
+            >= MAX_TASK_LLM_STEPS
+        ):
+            return _finish_plan_at_budget_limit(
+                state,
+                budget_name="LLM 决策",
+                limit=MAX_TASK_LLM_STEPS,
+                turn_step=steps_this_turn,
+                on_event=on_event,
+            )
+        if plan_execution and state["plan"]["current_step_id"] is None:
+            state["plan"] = start_next_step(state["plan"])
+
         turn_step = steps_this_turn + 1
         next_total_step = state["step"] + 1
         _emit_event(
@@ -358,7 +410,13 @@ def run_agent(
         )
         llm_started_at = perf_counter()
         try:
-            response = decide_next_action(state)
+            if plan_execution:
+                response = decide_plan_step(state, state["plan"])
+            else:
+                response = decide_next_action(
+                    state,
+                    allow_planning=steps_this_turn == 0,
+                )
         except KeyboardInterrupt:
             cancelled_answer = "当前模型调用已取消。"
             state["messages"].append(
@@ -389,6 +447,11 @@ def run_agent(
             raise
         steps_this_turn += 1
         state["step"] += 1
+        if plan_execution:
+            state["plan"] = record_plan_usage(
+                state["plan"],
+                llm_steps=1,
+            )
         _emit_event(
             on_event,
             {
@@ -400,11 +463,45 @@ def run_agent(
             },
         )
 
+        if response["type"] == "plan":
+            try:
+                plan = _create_runtime_plan(state, response)
+            except Exception as error:
+                _emit_event(
+                    on_event,
+                    {
+                        "kind": "run_failed",
+                        "turn_step": turn_step,
+                        "total_step": state["step"],
+                        "error_type": type(error).__name__,
+                        "message": str(error),
+                    },
+                )
+                raise
+            answer = _format_plan_answer(plan, created=True)
+            state["messages"].append(
+                {"role": "assistant", "content": answer}
+            )
+            _emit_event(
+                on_event,
+                {
+                    "kind": "turn_finished",
+                    "turn_step": turn_step,
+                    "total_step": state["step"],
+                    "status": "planned",
+                },
+            )
+            return answer
+
         if response["type"] == "final":
             final_answer = response["content"]
             state["messages"].append(
                 {"role": "assistant", "content": final_answer}
             )
+            if plan_execution:
+                state["plan"] = complete_current_step(state["plan"])
+                if state["plan"]["status"] != "completed":
+                    continue
             _emit_event(
                 on_event,
                 {
@@ -435,6 +532,19 @@ def run_agent(
         tool_name = response["tool_name"]
         tool_arguments = response["tool_arguments"]
         tool_call_id = response["tool_call_id"]
+
+        if (
+            plan_execution
+            and state["plan"]["budget"]["tool_calls"]
+            >= MAX_TASK_TOOL_CALLS
+        ):
+            return _finish_plan_at_budget_limit(
+                state,
+                budget_name="Tool 执行",
+                limit=MAX_TASK_TOOL_CALLS,
+                turn_step=turn_step,
+                on_event=on_event,
+            )
 
         state["messages"].append(
             {
@@ -480,14 +590,28 @@ def run_agent(
                     "message": f"Tool '{tool_name}' was cancelled by the user.",
                 }
             }
-        state["messages"].append(
-            {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "name": tool_name,
-                "content": observation,
-            }
-        )
+        tool_message = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+            "content": observation,
+        }
+        if plan_execution:
+            evidence_ref = (
+                "tool-result-"
+                f"{state['plan']['budget']['tool_calls'] + 1:03d}"
+            )
+            updated_plan = record_plan_usage(
+                state["plan"],
+                tool_calls=1,
+            )
+            updated_plan = record_current_step_evidence(
+                updated_plan,
+                [evidence_ref],
+            )
+            tool_message["evidence_ref"] = evidence_ref
+            state["plan"] = updated_plan
+        state["messages"].append(tool_message)
         _emit_event(
             on_event,
             {
@@ -530,6 +654,103 @@ def run_agent(
         },
     )
     return stopped_answer
+
+
+def _create_runtime_plan(state: dict, action: dict) -> dict:
+    """Create trusted Plan fields from one normalized internal plan action."""
+    expected_fields = {
+        "type",
+        "content",
+        "tool_call_id",
+        "step_descriptions",
+    }
+    if set(action) != expected_fields or action.get("type") != "plan":
+        raise ValueError("Invalid internal plan action contract.")
+    if action.get("content") is not None:
+        raise ValueError("An internal plan action cannot contain text.")
+    if not isinstance(action.get("tool_call_id"), str) or not action[
+        "tool_call_id"
+    ]:
+        raise ValueError("An internal plan action requires a call ID.")
+    if state.get("plan") is not None or state.get("task_id") is not None:
+        raise ValueError("The current State already contains a task Plan.")
+
+    task_id = f"task-{uuid4().hex}"
+    plan = create_plan(
+        task_id=task_id,
+        goal=_latest_user_goal(state),
+        step_descriptions=action["step_descriptions"],
+    )
+    plan = record_plan_usage(plan, llm_steps=1)
+
+    state["task_id"] = task_id
+    state["plan"] = plan
+    return plan
+
+
+def _latest_user_goal(state: dict) -> str:
+    """Return the user message that caused the current planning decision."""
+    for message in reversed(state.get("messages", [])):
+        content = message.get("content") if isinstance(message, dict) else None
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and isinstance(content, str)
+            and content.strip()
+        ):
+            return content.strip()
+    raise ValueError("Cannot create a Plan without a user goal.")
+
+
+def _active_plan(state: dict) -> dict | None:
+    """Return a validated active Plan without allowing silent replacement."""
+    plan = state.get("plan")
+    if plan is None:
+        return None
+    validate_plan(plan)
+    if state.get("task_id") != plan["task_id"]:
+        raise ValueError("State task_id does not match its Plan.")
+    if plan["status"] in {"running", "blocked"}:
+        return plan
+    return None
+
+
+def _format_plan_answer(plan: dict, *, created: bool) -> str:
+    """Render a bounded Plan preview for creation or a blocked task."""
+    if created:
+        heading = "已创建任务计划："
+    else:
+        heading = "当前任务处于阻塞状态，请先补充完成当前步骤所需的信息："
+    lines = [heading]
+    lines.extend(
+        f"{index}. {step['description']}"
+        for index, step in enumerate(plan["steps"], start=1)
+    )
+    return "\n".join(lines)
+
+
+def _finish_plan_at_budget_limit(
+    state: dict,
+    *,
+    budget_name: str,
+    limit: int,
+    turn_step: int,
+    on_event: EventHandler | None,
+) -> str:
+    """Fail an active Plan before exceeding a trusted Runtime budget."""
+    state["plan"] = fail_plan(state["plan"])
+    answer = f"任务已停止：已达到 {budget_name}上限（{limit}）。"
+    state["messages"].append({"role": "assistant", "content": answer})
+    _emit_event(
+        on_event,
+        {
+            "kind": "turn_finished",
+            "turn_step": turn_step,
+            "total_step": state["step"],
+            "status": "failed",
+        },
+    )
+    return answer
 
 
 def _elapsed_ms(started_at: float) -> float:

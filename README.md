@@ -29,7 +29,22 @@ LLM 决策 -> Runtime 执行 Tool -> Tool Result 写回 State -> LLM 再决策
   和无 ANSI 的 `--plain` 模式。
 - V2 已通过真实 arXiv、DeepSeek 和 PDF 的端到端验收，V2.0.1 的提取正确性与
   交互式终端也已完成；V2.1 的全文覆盖、检索评测、资源测量和排序方法选择均已
-  完成。下一版本开始前先讨论并定义 V3 的单一目标。
+  完成。V3 已完成 Plan 数据契约、Planner 输入边界、Runtime 可信 Plan 创建和最小
+  step Executor；Replan、blocked 与 Checkpoint 尚未接入。
+
+V3 的单一目标是“可恢复的单 Agent 计划执行器”：为多论文、多步骤任务增加显式
+Planning、有限 Replanning 和本地 Checkpoint 恢复。当前 `planning.py` 已提供最多
+8 步的版本化 Plan、严格校验与纯状态转换；`planner.py` 允许首次模型决策在内部
+`submit_plan`、普通 Tool Call 和最终回答之间选择。第一版继续保持单 Agent、串行
+Tool Calling 和框架无关；长期 Memory、Multi-Agent、LangGraph、MCP、向量检索与
+并发执行不属于本阶段。详细拆分见 [开发路线](TODO.md) 和
+[V3 阶段记录](docs/agent-development-process.md#75-v3可恢复的单-agent-计划执行器)。
+
+当前 Runtime 收到 `plan` 动作后，会用最新用户消息和 Runtime 生成的 UUID 创建
+可信 Plan，并把首次规划调用计入任务预算；不会把 `submit_plan` 当作 Tool 执行。
+创建后先显示 Plan，下一条用户消息会启动第一个 pending step。`executor.py` 只向
+模型注入当前 step；Tool Result 先成为 Runtime 生成的可信 evidence reference，只有
+step-level final 才完成该 step。任务累计最多 32 次 LLM 决策和 24 次 Tool 执行。
 
 详细范围和信息流见：
 
