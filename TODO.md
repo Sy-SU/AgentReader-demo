@@ -24,8 +24,8 @@ V3：Planning + Replanning + Checkpoint
 
 当前状态：V1、V2、V2.0.1 和 V2.1 均已完成。V3 已完成 Plan 纯数据层、Planner
 输入边界、Runtime 可信 Plan 创建、最小 step Executor 和 DeepSeek thinking 多步
-消息协议；尚未接入 Replan、blocked 或 Checkpoint。目标是让单 Agent 对多论文
-任务进行显式规划、有限重规划，并在进程退出后恢复同一任务。
+消息协议、有限 Replan、`blocked`、Checkpoint/`--resume`、终端命令、Runtime
+Events、规划评测和真实多论文系统验收。
 
 ---
 
@@ -281,7 +281,7 @@ save_paper 写入本地文献库
 
 ---
 
-## 8. V3：可恢复的单 Agent 计划执行器（最小 Executor 已完成）
+## 8. V3：可恢复的单 Agent 计划执行器（已完成）
 
 目标任务示例：搜索两篇指定方向的代表论文，下载 PDF，分别检索方法和实验依据，
 最后给出带论文与页码证据的比较。V3 不改变已有 Tool 的可信 ID、人工确认和有界
@@ -306,28 +306,29 @@ Context 原则。
   Plan；普通 `tool_call|final` 保持 V2 路径。
 - [x] Runtime 独占 Plan 状态、任务预算和可信证据引用的写权限；模型返回的 Tool
   Call ID 不会直接成为 evidence reference。
-- [ ] Planner 生成面向结果的高层步骤，不硬编码具体 Tool 调用序列。
+- [x] Planner 生成面向结果的高层步骤，不硬编码具体 Tool 调用序列。
 - [x] Executor 复用现有 Agent Loop，每次仍只执行一个 Tool Call。
 - [x] Runtime 启动第一个 pending step，将当前目标注入模型 Context；模型返回
   step-level final 后才完成该 step，而不是把任意一次 Tool 成功直接当作完成。
-- [ ] Tool 失败、候选歧义或检索证据不足时才允许 Replan；普通成功步骤不重复规划。
+- [x] Tool 失败、候选歧义或检索证据不足时才允许 Replan；普通成功步骤不重复规划。
 - [x] Runtime 记录任务级 LLM/Tool 用量，并在执行前阻止超过 32 次 LLM 决策或
   24 次 Tool 执行。
-- [ ] 每个任务最多 Replan 2 次。
-- [ ] Replan 必须保留已完成步骤、可信结果和证据，不能重复有副作用的操作。
-- [ ] 缺少关键用户选择时进入 `blocked` 并请求澄清，不得由模型擅自补全。
-- [ ] 保存论文仍逐篇经过 `y/N` 确认；原始请求没有授权的副作用不能被 Plan 扩大。
-- [ ] 为成功、失败恢复、阻塞、预算耗尽和重复副作用增加 Runtime/Fake LLM 测试。
+- [x] 每个任务最多 Replan 2 次。
+- [x] Replan 必须保留已完成步骤、可信结果和证据，不能重复有副作用的操作。
+- [x] 缺少关键用户选择时进入 `blocked` 并请求澄清，不得由模型擅自补全。
+- [x] 保存论文仍逐篇经过 `y/N` 确认；原始请求没有授权的副作用不能被 Plan 扩大。
+- [x] 为成功、失败恢复、阻塞、预算耗尽和重复副作用增加 Runtime/Fake LLM 测试。
 
-当前最小 Executor 已打通 `pending → running → completed`：创建 Plan 后先返回预览，
-下一条用户消息开始执行；每次 Tool Result 在对应 Tool 消息和当前 step 中写入同一个
-Runtime-owned `tool-result-NNN` 引用，Tool 本身不会完成 step。多个 step 在同一个
-现有 Loop 内串行推进，step-level final 才触发完成；达到单轮 `max_steps` 时保留活动
-Plan，后续轮次可以继续。单轮默认值已由 5 调整为 20；如果活动 Plan 仍达到上限，
-终端用中文说明任务只是暂停并提示输入“继续”。任务级 32 次 LLM 决策和 24 次 Tool
-执行上限保持不变。新增 2 项 Executor 测试、4 项 Runtime 执行/预算测试和 1 项
-evidence 转换测试；最小 Executor 阶段真实 arXiv + DeepSeek 全量 142 项通过、无
-跳过。
+当前 Executor 已打通 `pending → running → completed|blocked|failed`。Runtime 从
+最新尚未处理的 Tool Result 中识别失败、歧义和证据不足，只在这些条件下临时开放
+`submit_plan`；Replan 会先结束失败步骤，再保留所有 completed/failed 历史与可信
+evidence，只替换 pending 后缀，并增加 revision 和 Replan 预算。内部
+`request_clarification` 会阻塞当前步骤，用户补充信息后原步骤恢复并增加 attempts。
+重规划后的重复保存或下载复用先前可信 Tool Result，不再次执行副作用。达到单轮
+`max_steps` 时失败信号与活动 Plan 都会保留，后续输入“继续”仍可完成 Replan。
+任务级 32/24/2 预算保持不变。本阶段新增 14 项 Plan、Executor 与 Runtime 测试；
+真实 arXiv + DeepSeek 全量 170 项通过，无跳过。Checkpoint 与恢复现已在 Step 3
+完成。
 
 ### Step 2 前置：DeepSeek thinking 消息协议升级（已完成）
 
@@ -349,8 +350,8 @@ thinking 协议的实现范围：
   解析、不修改，也不将它当作文献证据。
 - [x] `_to_api_messages()` 在带 Tool 的后续 DeepSeek 请求中原样回传对应
   `reasoning_content`，保持 Tool Calling 消息协议完整。
-- [x] 普通终端和 Debug 默认不显示 reasoning 内容；后续 Checkpoint 是否保存该字段
-  必须在实现恢复前单独评估大小、隐私和 Provider 兼容性。
+- [x] 普通终端和 Debug 默认不显示 reasoning 内容；Checkpoint 因恢复 Provider
+  协议需要而保存该字段，并以严格结构校验和 4 MiB 总上限控制边界。
 - [x] 增加响应解析、消息序列化、thinking Tool Call 多轮回传、非 thinking 兼容和
   OpenRouter 缺少或使用不同 reasoning 字段时的测试。
 - [x] 完成后显式运行 DeepSeek 联网测试，不得把联网用例计为跳过，并同步更新
@@ -362,35 +363,51 @@ OpenRouter 同时兼容字符串 reasoning 和结构化 `reasoning_details`，�
 开启推理。普通与 Debug 终端都不显示该字段。新增 13 项协议、Planner、Runtime 和
 真实 DeepSeek 集成测试；启用真实 arXiv 与 DeepSeek 后，全量 155 项通过、无跳过。
 OpenRouter 兼容性当前由 Mock API 响应和请求参数覆盖，尚未使用真实 OpenRouter
-Key 验收。下一步进入有限 Replan 与 `blocked`。
+Key 验收。该协议升级之后，有限 Replan 与 `blocked` 已完成；下一步进入
+Checkpoint 与恢复。
 
 ### Step 3：Checkpoint 与恢复
 
-- [ ] 同一进程只允许一个活动计划任务，使用稳定 `task_id` 标识。
-- [ ] 每次 Plan 或步骤状态变化后，将版本化 Checkpoint 原子写入
+- [x] 同一进程只允许一个活动计划任务，使用稳定 `task_id` 标识。
+- [x] 每次 Plan 或步骤状态变化后，将版本化 Checkpoint 原子写入
   `data/checkpoints/active.json`；文件最大 4 MiB，并被 Git 忽略。
-- [ ] Checkpoint 不保存 API Key、PDF 二进制、全文索引或其他未进入 State 的数据。
-- [ ] `python main.py --resume` 校验并恢复 `running|blocked` 任务；损坏或过期结构
+- [x] Checkpoint 不保存 API Key、PDF 二进制、全文索引或其他未进入 State 的数据。
+- [x] `python main.py --resume` 校验并恢复 `running|blocked` 任务；损坏或过期结构
   必须报错，不能静默覆盖。
-- [ ] Ctrl+C 或可恢复错误后保留可恢复 Checkpoint；任务完成、失败或明确取消后清除
-  活动 Checkpoint。Checkpoint 是同一任务恢复，不是跨任务长期 Memory。
-- [ ] 启动时若发现活动 Checkpoint，必须提示使用 `--resume`，不能由新任务静默覆盖。
-- [ ] 恢复时重新校验 PDF 缓存与可信 ID，已完成步骤不得再次执行。
-- [ ] 为写入中断、损坏文件、版本失效、超限、恢复和幂等行为增加测试。
+- [x] Ctrl+C 或可恢复错误后保留可恢复 Checkpoint；任务完成或失败后清除。显式
+  `/cancel` 的清理已由 Step 4 终端入口完成。
+- [x] 启动时若发现活动 Checkpoint，必须提示使用 `--resume`，不能由新任务静默覆盖。
+- [x] 恢复时重新校验 PDF 缓存与可信 ID，已完成步骤不得再次执行。
+- [x] 为写入中断、损坏文件、版本失效、超限、恢复和幂等行为增加测试。
+
+实现结果：新增独立 `checkpoint.py`，只接受完整有效的 `running|blocked` State，
+使用同目录唯一临时文件、`fsync` 和 `os.replace` 原子更新。恢复会严格校验消息配对、
+Plan evidence、稳定论文 ID 和下载缓存；thinking reasoning 作为恢复 Provider 协议所
+需的不透明 State 字段保留，但不会显示。CLI 在读取新任务前检测冲突，`--resume`
+仅输出有界摘要。真实 arXiv + DeepSeek 全量 190 项通过，无跳过。
 
 ### Step 4：终端、事件与验收
 
-- [ ] 增加 `/plan` 查看当前计划，增加 `/cancel` 明确取消活动任务，并同步 `/help`。
-- [ ] 活动任务未取消时，`/clear` 不得静默丢弃其 Checkpoint。
-- [ ] 活动任务执行期间，普通用户消息只用于补充或澄清该任务；开始无关目标前必须
+- [x] 增加 `/plan` 查看当前计划，增加 `/cancel` 明确取消活动任务，并同步 `/help`。
+- [x] 活动任务未取消时，`/clear` 不得静默丢弃其 Checkpoint。
+- [x] 活动任务执行期间，普通用户消息只用于补充或澄清该任务；开始无关目标前必须
   先完成或取消当前任务。
-- [ ] Runtime 增加 UI 无关的计划创建、步骤转换、Replan、Checkpoint 和阻塞事件；
+- [x] Runtime 增加 UI 无关的计划创建、步骤转换、Replan、Checkpoint 和阻塞事件；
   Debug 输出保持有界。
-- [ ] 建立确定性的两篇论文规划评测，记录完成率、Replan 次数、LLM/Tool 步数和
+- [x] 建立确定性的两篇论文规划评测，记录完成率、Replan 次数、LLM/Tool 步数和
   Checkpoint 大小。
-- [ ] 使用真实 arXiv、DeepSeek 和 PDF 完成一次多论文端到端任务；完整联网测试
+- [x] 使用真实 arXiv、DeepSeek 和 PDF 完成一次多论文端到端任务；完整联网测试
   不得跳过。
-- [ ] 将实现、限制、测试结果和关键决策同步到全部项目文档。
+- [x] 将实现、限制、测试结果和关键决策同步到全部项目文档。
+
+实现结果：`/plan` 有界显示 Runtime-owned Plan；`/cancel` 由 Runtime 先清除
+Checkpoint 再提交取消状态，清除失败不会产生半取消。活动 Plan 存在时，普通文本
+始终追加到同一个 State，不能静默创建第二个任务。计划创建、步骤转换、Replan、
+blocked、cancelled 和 Checkpoint 保存均通过深拷贝 Runtime Event 暴露，终端只是
+观察者。确定性两论文评测记录 completed=true、Replan=0、LLM=6、Tool=2、
+Checkpoint 保存 13 次、最大 4,572 B。真实系统测试使用受控四步计划降低 Planner
+随机性，其余 DeepSeek Executor、arXiv、两份 PDF、全文索引和页码证据链均走正式
+路径。2026-09-13 全量联网测试 202 项全部通过、无跳过。
 
 ### V3 明确非目标
 

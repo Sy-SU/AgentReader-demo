@@ -5,6 +5,7 @@ from planning import (
     MAX_EVIDENCE_REFS_PER_STEP,
     MAX_PLAN_STEPS,
     MAX_TASK_LLM_STEPS,
+    MAX_TASK_REPLANS,
     PlanValidationError,
     block_current_step,
     cancel_plan,
@@ -14,6 +15,7 @@ from planning import (
     fail_plan,
     record_current_step_evidence,
     record_plan_usage,
+    revise_plan,
     resume_blocked_step,
     start_next_step,
     validate_plan,
@@ -145,7 +147,7 @@ class PlanContractTests(unittest.TestCase):
 
         fake_completed = deepcopy(plan)
         fake_completed["status"] = "completed"
-        with self.assertRaisesRegex(PlanValidationError, "every step completed"):
+        with self.assertRaisesRegex(PlanValidationError, "completed task"):
             validate_plan(fake_completed)
 
     def test_validate_plan_rejects_untrusted_evidence_references(self):
@@ -232,6 +234,83 @@ class PlanTransitionTests(unittest.TestCase):
 
         terminal = fail_plan(awaiting_replan)
         self.assertEqual(terminal["status"], "failed")
+
+    def test_replan_preserves_history_and_replaces_only_pending_steps(self):
+        created = create_plan(
+            "task-1",
+            "goal",
+            ["completed work", "failed work", "old pending", "old tail"],
+        )
+        first_running = start_next_step(created)
+        first_done = complete_current_step(first_running, ["tool:001"])
+        second_running = start_next_step(first_done)
+        awaiting_replan = fail_current_step(second_running, ["tool:002"])
+        snapshot = deepcopy(awaiting_replan)
+
+        revised = revise_plan(
+            awaiting_replan,
+            ["alternate evidence", "finish comparison"],
+        )
+
+        self.assertEqual(awaiting_replan, snapshot)
+        self.assertEqual(revised["revision"], 2)
+        self.assertEqual(revised["budget"]["replans"], 1)
+        self.assertEqual(
+            [step["id"] for step in revised["steps"]],
+            ["step-001", "step-002", "step-005", "step-006"],
+        )
+        self.assertEqual(
+            [step["status"] for step in revised["steps"]],
+            ["completed", "failed", "pending", "pending"],
+        )
+        self.assertEqual(
+            [step["evidence_refs"] for step in revised["steps"][:2]],
+            [["tool:001"], ["tool:002"]],
+        )
+        self.assertNotIn("old pending", str(revised))
+        self.assertNotIn("old tail", str(revised))
+
+        replacement_running = start_next_step(revised)
+        replacement_done = complete_current_step(replacement_running)
+        final_running = start_next_step(replacement_done)
+        completed = complete_current_step(final_running)
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(
+            [step["status"] for step in completed["steps"]],
+            ["completed", "failed", "completed", "completed"],
+        )
+
+    def test_replan_requires_failure_budget_and_available_capacity(self):
+        created = create_plan("task-1", "goal", ["one", "two"])
+        with self.assertRaisesRegex(PlanValidationError, "failed step"):
+            revise_plan(created, ["replacement"])
+
+        running = start_next_step(created)
+        with self.assertRaisesRegex(PlanValidationError, "must fail"):
+            revise_plan(running, ["replacement"])
+
+        awaiting_replan = fail_current_step(running)
+        once_revised = revise_plan(awaiting_replan, ["retry one"])
+        once_failed = fail_current_step(start_next_step(once_revised))
+        at_limit = revise_plan(once_failed, ["retry two"])
+        at_limit = fail_current_step(start_next_step(at_limit))
+        self.assertEqual(
+            at_limit["budget"]["replans"],
+            MAX_TASK_REPLANS,
+        )
+        with self.assertRaisesRegex(PlanValidationError, "replan limit"):
+            revise_plan(at_limit, ["replacement"])
+
+        full = create_plan(
+            "task-full",
+            "goal",
+            [f"step {index}" for index in range(MAX_PLAN_STEPS)],
+        )
+        for _ in range(MAX_PLAN_STEPS - 1):
+            full = complete_current_step(start_next_step(full))
+        full = fail_current_step(start_next_step(full))
+        with self.assertRaisesRegex(PlanValidationError, "capacity"):
+            revise_plan(full, ["replacement"])
 
     def test_cancel_and_fail_close_an_active_step(self):
         running = start_next_step(create_plan("task-1", "goal", ["one"]))

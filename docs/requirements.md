@@ -8,8 +8,8 @@
 当前版本定位：V1 最小 Agent Loop、V2 真实搜索/管理/阅读/最小检索、V2.0.1
 提取正确性和交互式终端，以及 V2.1 全文索引、离线评测、资源测量和排序方法选择
 均已完成。V3 已完成 Plan 纯数据层、Planner 输入边界、Runtime 可信 Plan 创建、
-最小 step Executor 和 DeepSeek thinking 多步消息协议；Replan、blocked 与
-Checkpoint 尚未实现。
+最小 step Executor、DeepSeek thinking 多步消息协议、有限 Replan、blocked，以及
+Checkpoint 与 `--resume`、终端任务控制、扩展事件、规划评测和真实多论文验收。
 
 ## 2. 学习目标
 
@@ -38,7 +38,8 @@ Agent = LLM + Tools + Loop + State
 - 保存操作执行前，终端展示可信论文 metadata 并读取 `y/N` 确认。
 - 空输入不得退出；`/exit`、`exit`、`quit`、`退出` 或输入流结束可以结束会话。
 - `/help` 显示命令，`/debug [on|off]` 在会话内切换调试模式，`/clear` 清空当前
-  State；Slash Commands 不得进入 State 或发送给模型。
+  State，`/plan` 查看有界计划，`/cancel` 取消活动任务；Slash Commands 不得进入
+  State 或发送给模型。
 - 交互式 TTY 提供当前进程内的输入历史和 Slash Command 补全，不把历史默认写盘。
 - `python main.py --debug` 按实际发生顺序显示每步 LLM 决策、Tool Call、Tool Result
   和耗时，不需要等待整轮完成。
@@ -62,8 +63,9 @@ Agent = LLM + Tools + Loop + State
   必须保持原有 `final|tool_call` 契约。
 - Runtime 必须把归一化 reasoning 作为对应 Assistant 消息的不透明协议元数据保存，
   不得解释、修改或当作文献证据；后续 Provider 请求必须原样回传。
-- 普通终端、Debug Trace 和 Runtime Event 不得输出 reasoning 内容。Checkpoint 是否
-  持久化该字段须在恢复功能实现前单独评估。
+- 普通终端、Debug Trace 和 Runtime Event 不得输出 reasoning 内容。活动任务的
+  Checkpoint 必须保存该字段，确保恢复后的 Provider 协议连续；它仍受 Checkpoint
+  结构校验和 4 MiB 总上限约束。
 
 ### FR-3：文献搜索
 
@@ -327,7 +329,7 @@ Tool Call 与 final 不变，而且该内部契约不在 Tool Registry。当前 
 21 项测试通过；启用真实 arXiv 与 DeepSeek 后，当时全量 128 项回归全部通过，没有
 跳过。
 
-### FR-17：V3 执行与有限 Replanning（最小 Executor 已实现）
+### FR-17：V3 执行与有限 Replanning（已实现）
 
 - Executor 必须复用现有串行 Agent Loop 和 Tool 安全边界，每次模型决策最多执行
   一个 Tool Call。
@@ -345,23 +347,34 @@ Tool Call 与 final 不变，而且该内部契约不在 Tool Registry。当前 
 - 最终回答必须区分 `completed`、`blocked`、`failed` 和 `cancelled`，并只引用实际
   Tool Result 中存在的论文与页码证据。
 
-当前 Runtime 已接入第一次 Planner 决策和最小 Executor。`plan` 动作只能包含
-Planner 规范化后的字段，Runtime 使用最新用户消息和本地 UUID 创建 Plan，将规划
-调用计为一次 `llm_steps`，再原子更新 State 中的 `task_id` 与 `plan`。创建后先显示
-有界 Plan；下一条用户消息启动第一个 pending step，`executor.py` 将任务目标、已完成
-步骤和当前 step 作为有界控制 Context 交给现有 Agent Loop。每次仍只执行一个 Tool
-Call；Runtime 为 Tool Result 分配 `tool-result-NNN` 引用并同时写入 Tool 消息与当前
-step。step-level final 才完成 step 并进入下一步。Runtime 在调用前阻止超过 32 次
-LLM 决策或 24 次 Tool 执行。
+当前 Runtime 已接入完整的有限 Replan 与阻塞恢复路径。它对最新未处理的 Tool
+Result 做确定性分类：Tool 错误、无候选、无词法匹配、检索证据不足、PDF 无可提取
+文本和空文献库属于硬失败；无精确标题匹配的多候选搜索属于可处理歧义。只有存在
+这些可信观察、尚有 Plan 容量且 Replan 预算未耗尽时，Executor 才会看到内部
+`submit_plan` Schema。模型提交的替换步骤数量还会根据已保留历史动态收紧。
+
+Replan 时 Runtime 先把当前步骤标为 failed，再由 `planning.revise_plan()` 保留全部
+completed/failed 步骤、attempts 和 evidence reference，删除旧 pending 后缀并创建
+新 step ID，同时增加 revision 和 `budget.replans`。每个任务最多 2 次 Replan；普通
+成功观察不能触发重规划。若硬失败后模型改为请求更多信息，Runtime 将当前步骤和
+任务置为 blocked；用户下一条消息恢复原步骤并增加 attempts。即使硬失败发生在
+单轮 `max_steps` 的最后一次 Tool Call，其可信失败信号也会跨“继续”保留。
+
+`save_paper` 和 `download_paper` 的相同参数已经产生成功结果后，后续 Plan/Replan
+调用会复用可信旧 Tool Result，并标记 `runtime_reused=true`，不再次执行写入或下载。
+首次 `save_paper` 仍通过现有 Runtime 人工确认边界逐篇询问 `y/N`。任务总预算仍为
+32 次 LLM 决策、24 次 Tool 调用和 2 次 Replan。
 
 DeepSeek thinking 多步协议也已接入：`llm.py` 提取每个 Assistant 响应的推理元数据，
 Planner 在内部化 `submit_plan` 时保留它，Runtime 将其附着到 Plan 预览、Tool Call
 和 step-level final 对应的 Assistant State 消息，下一次请求再由 `llm.py` 原样序列化。
 这样第三次及之后的 thinking Tool Calling 请求不会因丢失历史
 `reasoning_content` 被 Provider 拒绝。OpenRouter 的字符串与结构化 reasoning 格式
-已有离线兼容测试。Replan、blocked 与 Checkpoint 仍未接入。
+已有离线兼容测试。有限 Replan 与 blocked 已接入。本阶段
+新增 14 项 Plan、Executor 与 Runtime 用例；启用真实 arXiv 与 DeepSeek 后全量
+170 项通过，无跳过。
 
-### FR-18：V3 Checkpoint 与恢复（计划需求，尚未实现）
+### FR-18：V3 Checkpoint 与恢复（核心已实现）
 
 - 同一 CLI 进程同时只能有一个活动计划任务，并使用稳定 `task_id` 标识。
 - 每次 Plan 创建、步骤状态转换、Replan 或阻塞后，Runtime 必须写入版本化
@@ -374,14 +387,19 @@ Planner 在内部化 `submit_plan` 时保留它，Runtime 将其附着到 Plan �
   版本不兼容必须给出明确错误，不能静默覆盖。
 - 恢复时必须重新校验缓存文件、稳定 ID 和已有 Tool Result。完成步骤不得重复执行，
   未完成的写入操作不得被假定为已获授权。
-- Ctrl+C 和可恢复 Runtime 错误应保留活动 Checkpoint；任务完成或用户明确取消后
-  清除活动 Checkpoint。任务达到不可恢复的 `failed` 后也应清除活动文件，但先输出
-  有界诊断。
+- Ctrl+C 和可恢复 Runtime 错误保留活动 Checkpoint；任务完成或达到不可恢复的
+  `failed` 后清除活动文件。用户明确取消时由 FR-19 `/cancel` 入口清除。
 - 程序启动时发现活动 Checkpoint，必须提示使用 `--resume`；新任务不能静默覆盖旧
   Checkpoint。
 - Checkpoint 只用于恢复同一个任务，不会被自动召回到新任务，因此不是长期 Memory。
 
-### FR-19：V3 终端、事件与评测（计划需求，尚未实现）
+实现采用同目录 `NamedTemporaryFile`、文件 `fsync` 和 `os.replace`。恢复时严格校验
+Checkpoint 版本/时间、State/Plan 契约、Assistant Tool Call 与 Tool Result 配对、
+Plan evidence reference、稳定论文 ID 和已下载 PDF 缓存；任一校验失败都拒绝恢复且
+不覆盖原文件。CLI 恢复摘要不会显示 messages 或 reasoning。活动计划下 `/clear`
+已被拒绝；显式 `/cancel` 已通过 FR-19 接入同一可信清理边界。
+
+### FR-19：V3 终端、事件与评测（已实现）
 
 - `/plan` 必须以有界形式显示目标、revision、任务状态、当前步骤和各步骤状态；
   `/cancel` 明确取消当前活动任务，并同步更新 `/help`。
@@ -396,6 +414,19 @@ Planner 在内部化 `submit_plan` 时保留它，Runtime 将其附着到 Plan �
   Checkpoint 字节数；这些数据必须与普通 Debug 文本分离，能够机器读取。
 - 最终验收必须显式启用真实 arXiv 与 DeepSeek，并使用真实 PDF 完成一次多论文、
   多步骤、带页码证据的任务；联网用例不得计为跳过。
+
+当前实现中，`/plan` 只显示有界目标、revision、任务状态、当前步骤和各步骤状态；
+`/cancel` 调用 Runtime 取消入口，在成功清除 Checkpoint 后才更新 State，清除失败时
+两者均保持活动。计划生命周期新增 `plan_created`、`plan_step_changed`、
+`plan_replanned`、`task_blocked`、`task_cancelled` 和 `checkpoint_saved` 事件；事件
+不携带 reasoning 或 Checkpoint 路径，并继续使用深拷贝隔离观察者。
+
+`evaluate_planning.py` 使用正式 Runtime、固定 Provider 响应和固定 Tool 数据执行
+两论文成功场景，可输出人类报告或 JSON。当前确定性结果为 completed=true、
+Replan=0、LLM 决策 6 次、Tool 执行 2 次、Checkpoint 保存 13 次、最大 4,572 B。
+真实系统用例以固定四步高层计划减少 Planner 随机性，但 DeepSeek Executor、arXiv
+搜索、两份 PDF 下载、全文索引、页码检索和最终比较均走正式路径。2026-09-13
+完整联网验收运行 202 项测试，202 项全部通过，没有跳过。
 
 ## 4. 状态需求
 
@@ -431,7 +462,7 @@ Checkpoint 是 State 的持久化快照；Context 仍是某一次模型调用选
 - `.env` 保存本地 Provider 配置和 API Key，不提交到 Git。
 - `data/library.json` 是个人文献库数据，不提交到 Git。
 - `data/pdfs/` 和 `data/indexes/` 是可重新生成的本地缓存，不提交到 Git。
-- V3 的 `data/checkpoints/` 是可恢复的任务状态，不提交到 Git；实现前还不存在。
+- V3 的 `data/checkpoints/` 是可恢复的任务状态，不提交到 Git。
 - 默认离线测试不得访问真实模型或外部文献 API。
 - 在线测试必须通过环境变量显式启用。
 - 完整验收必须同时设置 `RUN_LIVE_ARXIV_TESTS=1` 和 `RUN_LIVE_LLM_TESTS=1`，实际
@@ -448,8 +479,8 @@ Checkpoint 是 State 的持久化快照；Context 仍是某一次模型调用选
   查询词覆盖门槛已拦截固定评测中的通用词无答案误命中，但阈值只经过小型教学
   数据集验证，并非通用置信度。中文查询英文正文仍无直接召回，当前没有 embedding
   或语义重排；Agent 只能通过生成英文技术词做轻量查询改写。
-- 终端不是全屏 TUI，不支持逐 token 流式输出、后台任务和跨进程历史；Ctrl+C 能
-  安全结束当前调用，但不提供中间检查点或恢复执行。
+- 终端不是全屏 TUI，不支持逐 token 流式输出、后台任务和一般对话历史恢复；活动
+  Plan 的 Ctrl+C 和进程退出可以通过 Checkpoint 恢复同一任务，但不是长期 Memory。
 
 ## 7. V2–V2.1 验收结果与下一里程碑
 
@@ -471,8 +502,9 @@ V2 端到端验收已完成：
 
 V2.1 已完成：BM25 没有改善当前数据集指标，最低查询词覆盖门槛解决了已知的通用
 词误命中，因此默认保留 TF-IDF + 50% 门槛。V3 已确定为显式 Planning、有限
-Replanning 和同任务 Checkpoint 恢复；当前已完成 Plan 纯数据层、Planner 输入边界
-和 Runtime 可信 Plan 创建，尚未执行 step 或接入 Checkpoint。
+Replanning 和同任务 Checkpoint 恢复；当前已完成 Plan、Planner、Executor、有限
+Replan、blocked、Checkpoint、`--resume`、终端控制、Runtime Events、规划评测和
+真实多论文系统验收，V3 已完成。
 
 ## 8. 当前非目标
 

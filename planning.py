@@ -166,6 +166,10 @@ def validate_plan(plan: object) -> None:
         if step["status"] in {"running", "blocked"}:
             active_steps.append(step)
 
+    failed_step_count = sum(
+        step["status"] == "failed" for step in steps
+    )
+
     if len(active_steps) > 1:
         raise PlanValidationError(
             "a plan can contain at most one running or blocked step."
@@ -189,14 +193,22 @@ def validate_plan(plan: object) -> None:
             "current_step_id must be null when no step is active."
         )
 
+    _validate_budget(plan["budget"])
+
     if status == "running":
         if active_steps and active_steps[0]["status"] != "running":
             raise PlanValidationError(
                 "a running task cannot contain a blocked active step."
             )
-        if all(step["status"] == "completed" for step in steps):
+        if (
+            all(
+                step["status"] in {"completed", "failed"}
+                for step in steps
+            )
+            and failed_step_count <= plan["budget"]["replans"]
+        ):
             raise PlanValidationError(
-                "a task with all steps completed must be completed."
+                "a task with all steps terminal must not remain running."
             )
     elif status == "blocked":
         if len(active_steps) != 1 or active_steps[0]["status"] != "blocked":
@@ -204,18 +216,32 @@ def validate_plan(plan: object) -> None:
                 "a blocked task must have exactly one blocked current step."
             )
     elif status == "completed":
-        if current_step_id is not None or not all(
-            step["status"] == "completed" for step in steps
+        if (
+            current_step_id is not None
+            or not all(
+                step["status"] in {"completed", "failed"}
+                for step in steps
+            )
+            or steps[-1]["status"] != "completed"
         ):
             raise PlanValidationError(
-                "a completed task must have every step completed and no current step."
+                "a completed task must end in a completed step, contain only "
+                "terminal step history, and have no current step."
             )
     elif active_steps:
         raise PlanValidationError(
             "a failed or cancelled task cannot have an active step."
         )
 
-    _validate_budget(plan["budget"])
+    replan_count = plan["budget"]["replans"]
+    if replan_count > failed_step_count:
+        raise PlanValidationError(
+            "replan usage cannot exceed the number of failed steps."
+        )
+    if failed_step_count > replan_count + 1:
+        raise PlanValidationError(
+            "a plan cannot contain more than one unresolved failed step."
+        )
 
 
 def record_plan_usage(
@@ -263,7 +289,10 @@ def start_next_step(plan: dict) -> dict:
         raise PlanValidationError("only a running task can start a step.")
     if plan["current_step_id"] is not None:
         raise PlanValidationError("the plan already has an active step.")
-    if any(step["status"] == "failed" for step in plan["steps"]):
+    failed_step_count = sum(
+        step["status"] == "failed" for step in plan["steps"]
+    )
+    if failed_step_count > plan["budget"]["replans"]:
         raise PlanValidationError(
             "a failed step must be resolved by replanning before execution continues."
         )
@@ -292,7 +321,10 @@ def complete_current_step(
     _append_evidence_refs(step, evidence_refs)
     step["status"] = "completed"
     updated["current_step_id"] = None
-    if all(item["status"] == "completed" for item in updated["steps"]):
+    if all(
+        item["status"] in {"completed", "failed"}
+        for item in updated["steps"]
+    ):
         updated["status"] = "completed"
     validate_plan(updated)
     return updated
@@ -337,6 +369,60 @@ def fail_current_step(
     _append_evidence_refs(step, evidence_refs)
     step["status"] = "failed"
     updated["current_step_id"] = None
+    validate_plan(updated)
+    return updated
+
+
+def revise_plan(plan: dict, step_descriptions: list[str]) -> dict:
+    """Replace the unstarted suffix after a failed step with a new plan suffix."""
+    validate_plan(plan)
+    if plan["status"] != "running":
+        raise PlanValidationError("only a running task can be replanned.")
+    if plan["current_step_id"] is not None:
+        raise PlanValidationError(
+            "the running step must fail before the task can be replanned."
+        )
+    if not any(step["status"] == "failed" for step in plan["steps"]):
+        raise PlanValidationError("replanning requires a failed step.")
+    if plan["budget"]["replans"] >= MAX_TASK_REPLANS:
+        raise PlanValidationError("the task has reached its replan limit.")
+
+    replacements = normalize_step_descriptions(step_descriptions)
+    preserved_steps = [
+        deepcopy(step)
+        for step in plan["steps"]
+        if step["status"] in {"completed", "failed"}
+    ]
+    if len(preserved_steps) + len(replacements) > MAX_PLAN_STEPS:
+        raise PlanValidationError(
+            "completed and failed history leaves too little plan capacity "
+            "for the replacement steps."
+        )
+
+    used_ids = {step["id"] for step in plan["steps"]}
+    next_number = _next_generated_step_number(used_ids)
+    replacement_steps = []
+    for description in replacements:
+        step_id = f"step-{next_number:03d}"
+        while step_id in used_ids:
+            next_number += 1
+            step_id = f"step-{next_number:03d}"
+        replacement_steps.append(
+            {
+                "id": step_id,
+                "description": description,
+                "status": "pending",
+                "attempts": 0,
+                "evidence_refs": [],
+            }
+        )
+        used_ids.add(step_id)
+        next_number += 1
+
+    updated = deepcopy(plan)
+    updated["steps"] = [*preserved_steps, *replacement_steps]
+    updated["revision"] += 1
+    updated["budget"]["replans"] += 1
     validate_plan(updated)
     return updated
 
@@ -512,3 +598,12 @@ def _validate_identifier(value: object, label: str) -> None:
 
 def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _next_generated_step_number(step_ids: set[str]) -> int:
+    numbers = []
+    for step_id in step_ids:
+        match = re.fullmatch(r"step-(\d+)", step_id)
+        if match is not None:
+            numbers.append(int(match.group(1)))
+    return max(numbers, default=0) + 1

@@ -1,7 +1,11 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from runtime import run_agent
+from planning import create_plan
+from runtime import cancel_active_task, run_agent
 from state import create_state
 
 
@@ -19,9 +23,174 @@ FINAL = {
     "tool_name": None,
     "tool_arguments": None,
 }
+PLAN = {
+    "type": "plan",
+    "content": None,
+    "tool_call_id": "plan-call",
+    "step_descriptions": ["Search for evidence", "Compare evidence"],
+}
+BLOCKED = {
+    "type": "blocked",
+    "content": "Which candidate should I use?",
+    "tool_call_id": "blocked-call",
+}
+REPLAN = {
+    "type": "replan",
+    "content": None,
+    "tool_call_id": "replan-call",
+    "step_descriptions": ["Use another evidence source"],
+}
 
 
 class RuntimeEventTests(unittest.TestCase):
+    def test_plan_creation_and_checkpoint_emit_bounded_metadata(self):
+        state = create_state("Compare two papers")
+        events = []
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "active.json"
+            with (
+                patch(
+                    "runtime.uuid4",
+                    return_value=SimpleNamespace(hex="events"),
+                ),
+                patch("runtime.decide_next_action", return_value=PLAN),
+            ):
+                run_agent(
+                    state,
+                    checkpoint_file=path,
+                    on_event=events.append,
+                )
+
+        self.assertEqual(
+            [event["kind"] for event in events],
+            [
+                "llm_started",
+                "llm_finished",
+                "plan_created",
+                "checkpoint_saved",
+                "turn_finished",
+            ],
+        )
+        self.assertEqual(events[2]["task_id"], "task-events")
+        self.assertEqual(events[2]["step_count"], 2)
+        self.assertGreater(events[3]["checkpoint_size_bytes"], 0)
+        self.assertNotIn("reasoning_content", events[3])
+
+    def test_step_start_completion_and_blocking_emit_transitions(self):
+        completed_state = create_state("Find evidence")
+        completed_state["task_id"] = "task-complete"
+        completed_state["plan"] = create_plan(
+            "task-complete",
+            "Find evidence",
+            ["Search for evidence"],
+        )
+        completed_events = []
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "active.json"
+            with patch("runtime.decide_plan_step", return_value=FINAL):
+                run_agent(
+                    completed_state,
+                    checkpoint_file=path,
+                    on_event=completed_events.append,
+                )
+
+        transitions = [
+            event
+            for event in completed_events
+            if event["kind"] == "plan_step_changed"
+        ]
+        self.assertEqual(
+            [
+                (event["previous_status"], event["status"])
+                for event in transitions
+            ],
+            [("pending", "running"), ("running", "completed")],
+        )
+
+        blocked_state = create_state("Choose a candidate")
+        blocked_state["task_id"] = "task-blocked"
+        blocked_state["plan"] = create_plan(
+            "task-blocked",
+            "Choose a candidate",
+            ["Resolve the candidate"],
+        )
+        blocked_events = []
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "active.json"
+            with patch("runtime.decide_plan_step", return_value=BLOCKED):
+                run_agent(
+                    blocked_state,
+                    checkpoint_file=path,
+                    on_event=blocked_events.append,
+                )
+
+        self.assertIn("task_blocked", [e["kind"] for e in blocked_events])
+        blocked_event = next(
+            event
+            for event in blocked_events
+            if event["kind"] == "task_blocked"
+        )
+        self.assertEqual(blocked_event["status"], "blocked")
+        self.assertEqual(blocked_event["step_id"], "step-001")
+
+    def test_replan_and_explicit_cancel_emit_lifecycle_events(self):
+        state = create_state("Find evidence")
+        state["task_id"] = "task-replan"
+        state["plan"] = create_plan(
+            "task-replan",
+            "Find evidence",
+            ["Search for evidence"],
+        )
+        events = []
+        search = Mock(
+            return_value={
+                "found": False,
+                "papers": [],
+                "relevance_assessment": {"status": "no_candidates"},
+            }
+        )
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "active.json"
+            with (
+                patch(
+                    "runtime.decide_plan_step",
+                    side_effect=[TOOL_CALL, REPLAN],
+                ),
+                patch.dict(
+                    "runtime.TOOL_REGISTRY",
+                    {"search_paper": search},
+                    clear=True,
+                ),
+            ):
+                run_agent(
+                    state,
+                    max_steps=2,
+                    checkpoint_file=path,
+                    on_event=events.append,
+                )
+
+            replan_event = next(
+                event
+                for event in events
+                if event["kind"] == "plan_replanned"
+            )
+            self.assertEqual(replan_event["plan_revision"], 2)
+            self.assertEqual(replan_event["replan_count"], 1)
+            self.assertIn("no usable candidate", replan_event["reason"])
+
+            cancel_events = []
+            cancel_active_task(
+                state,
+                checkpoint_file=path,
+                on_event=cancel_events.append,
+            )
+
+        self.assertEqual(cancel_events[-1]["kind"], "task_cancelled")
+        self.assertEqual(cancel_events[-1]["status"], "cancelled")
+
     def test_final_only_turn_emits_ordered_events(self):
         state = create_state("你好")
         events = []

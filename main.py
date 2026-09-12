@@ -1,6 +1,13 @@
 import argparse
+from pathlib import Path
 
-from runtime import run_agent
+from checkpoint import (
+    CheckpointError,
+    checkpoint_exists,
+    checkpoint_path,
+    load_checkpoint,
+)
+from runtime import cancel_active_task, run_agent
 from state import append_user_message, create_state
 from terminal import (
     EXIT_COMMANDS,
@@ -26,17 +33,37 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="disable colors, spinners, and enhanced terminal input",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="validate and resume the active planning checkpoint",
+    )
     return parser.parse_args()
 
 
 def main(
     debug: bool = False,
     plain: bool = False,
+    resume: bool = False,
     ui: TerminalUI | None = None,
+    checkpoint_file: str | Path | None = None,
 ) -> None:
     terminal = ui or TerminalUI(debug=debug, plain=plain)
-    state = None
+    active_checkpoint = checkpoint_path(checkpoint_file)
     terminal.print_banner()
+
+    if resume:
+        try:
+            state = load_checkpoint(active_checkpoint)
+        except CheckpointError as error:
+            terminal.print_checkpoint_error(error)
+            raise SystemExit(1) from error
+        terminal.print_checkpoint_restored(state, active_checkpoint)
+    else:
+        if checkpoint_exists(active_checkpoint):
+            terminal.print_checkpoint_available(active_checkpoint)
+            raise SystemExit(1)
+        state = None
 
     while True:
         try:
@@ -70,9 +97,41 @@ def main(
                 else:
                     terminal.print_help()
                 continue
+            if command_name == "/plan":
+                if argument:
+                    terminal.print_command_usage("/plan")
+                    continue
+                plan = _current_plan(state)
+                if plan is None:
+                    terminal.print_no_plan()
+                else:
+                    terminal.print_plan(plan)
+                continue
+            if command_name == "/cancel":
+                if argument:
+                    terminal.print_command_usage("/cancel")
+                    continue
+                if not _has_active_plan(state):
+                    terminal.print_no_active_task()
+                    continue
+                try:
+                    cancelled_plan = cancel_active_task(
+                        state,
+                        checkpoint_file=active_checkpoint,
+                        on_event=terminal.handle_event,
+                    )
+                except (CheckpointError, ValueError) as error:
+                    terminal.print_cancel_error(error)
+                    continue
+                terminal.print_task_cancelled(cancelled_plan)
+                state = None
+                continue
             if command_name == "/clear":
                 if argument:
                     terminal.print_command_usage("/clear")
+                    continue
+                if _has_active_plan(state):
+                    terminal.print_active_task_clear_rejected()
                     continue
                 state = None
                 terminal.clear_conversation()
@@ -102,6 +161,7 @@ def main(
                 state,
                 confirm_save=terminal.confirm_save,
                 on_event=terminal.handle_event,
+                checkpoint_file=active_checkpoint,
             )
         except (RuntimeError, ValueError) as error:
             terminal.report_unhandled_error(error)
@@ -115,6 +175,27 @@ def main(
         terminal.print_answer(final_answer)
 
 
+def _has_active_plan(state: dict | None) -> bool:
+    if not isinstance(state, dict):
+        return False
+    plan = state.get("plan")
+    return isinstance(plan, dict) and plan.get("status") in {
+        "running",
+        "blocked",
+    }
+
+
+def _current_plan(state: dict | None) -> dict | None:
+    if not isinstance(state, dict):
+        return None
+    plan = state.get("plan")
+    return plan if isinstance(plan, dict) else None
+
+
 if __name__ == "__main__":
     arguments = parse_args()
-    main(debug=arguments.debug, plain=arguments.plain)
+    main(
+        debug=arguments.debug,
+        plain=arguments.plain,
+        resume=arguments.resume,
+    )

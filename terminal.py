@@ -12,7 +12,14 @@ from events import AgentEvent
 EXIT_COMMANDS = {"exit", "quit", "退出"}
 SAVE_APPROVALS = {"y", "yes", "是", "确认"}
 DEBUG_TEXT_PREVIEW_CHARS = 400
-SLASH_COMMANDS = ("/help", "/debug", "/clear", "/exit")
+SLASH_COMMANDS = (
+    "/help",
+    "/plan",
+    "/cancel",
+    "/debug",
+    "/clear",
+    "/exit",
+)
 
 
 class TerminalUI:
@@ -104,6 +111,18 @@ class TerminalUI:
             self._stop_status()
             self._failure_reported = True
             self.print_error(event.get("message", "Agent 运行失败。"))
+        elif kind == "plan_created":
+            self._handle_plan_created(event)
+        elif kind == "plan_step_changed":
+            self._handle_plan_step_changed(event)
+        elif kind == "plan_replanned":
+            self._handle_plan_replanned(event)
+        elif kind == "task_blocked":
+            self._handle_task_blocked(event)
+        elif kind == "task_cancelled":
+            self._handle_task_cancelled(event)
+        elif kind == "checkpoint_saved":
+            self._handle_checkpoint_saved(event)
 
     def _handle_llm_started(self, event: AgentEvent) -> None:
         if self.debug:
@@ -164,6 +183,67 @@ class TerminalUI:
         suffix = f" · {summary}" if summary else ""
         self._write(f"{marker} {name}{suffix}{duration}")
 
+    def _handle_plan_created(self, event: AgentEvent) -> None:
+        self._stop_status()
+        if self.debug:
+            self._write(
+                "[Plan] created · "
+                f"revision {event.get('plan_revision')} · "
+                f"{event.get('step_count')} steps"
+            )
+
+    def _handle_plan_step_changed(self, event: AgentEvent) -> None:
+        self._stop_status()
+        step_id = event.get("step_id", "unknown-step")
+        status = event.get("status", "unknown")
+        description = _shorten(event.get("step_description", ""), 160)
+        if self.debug:
+            self._write(
+                f"[Plan] {step_id} · "
+                f"{event.get('previous_status', 'unknown')} → {status} · "
+                f"{description}"
+            )
+            return
+        marker = {
+            "running": "○",
+            "completed": "✓",
+            "blocked": "!",
+            "failed": "✗",
+        }.get(status, "·")
+        self._write(f"{marker} {step_id} · {status} · {description}")
+
+    def _handle_plan_replanned(self, event: AgentEvent) -> None:
+        self._stop_status()
+        self._write(
+            "↻ Plan revised · "
+            f"revision {event.get('plan_revision')} · "
+            f"replans {event.get('replan_count')}"
+        )
+
+    def _handle_task_blocked(self, event: AgentEvent) -> None:
+        self._stop_status()
+        if self.debug:
+            self._write(
+                "[Plan] blocked · "
+                f"{_shorten(event.get('reason', ''), 200)}"
+            )
+
+    def _handle_task_cancelled(self, event: AgentEvent) -> None:
+        self._stop_status()
+        if self.debug:
+            self._write(
+                "[Plan] cancelled · "
+                f"revision {event.get('plan_revision')}"
+            )
+
+    def _handle_checkpoint_saved(self, event: AgentEvent) -> None:
+        self._stop_status()
+        if self.debug:
+            self._write(
+                "[Checkpoint] saved · "
+                f"{event.get('checkpoint_size_bytes', 0)} bytes"
+            )
+
     def print_answer(self, answer: str) -> None:
         self._stop_status()
         if self._console is not None:
@@ -179,6 +259,8 @@ class TerminalUI:
         self._write(
             "\n可用命令：\n"
             "  /help           显示帮助\n"
+            "  /plan           显示当前任务计划\n"
+            "  /cancel         取消当前计划任务\n"
             "  /debug          切换 Debug 模式\n"
             "  /debug on|off   开启或关闭 Debug 模式\n"
             "  /clear          清空当前会话 State\n"
@@ -198,6 +280,69 @@ class TerminalUI:
             self.print_banner()
         self._write("当前会话 State 已清空。")
 
+    def print_active_task_clear_rejected(self) -> None:
+        self._stop_status()
+        self._write(
+            "当前存在未完成的计划任务，不能使用 /clear。"
+            "请先继续任务或使用 /cancel 明确取消。"
+        )
+
+    def print_plan(self, plan: dict) -> None:
+        self._stop_status()
+        current_step_id = plan.get("current_step_id")
+        current_step = next(
+            (
+                step
+                for step in plan.get("steps", [])
+                if step.get("id") == current_step_id
+            ),
+            None,
+        )
+        current_summary = (
+            f"{current_step_id} · "
+            f"{_shorten(current_step['description'], 160)}"
+            if current_step is not None
+            else "尚未开始或已经结束"
+        )
+        lines = [
+            "\n当前任务计划：",
+            f"  目标：{_shorten(str(plan.get('goal', '')), 200)}",
+            f"  状态：{plan.get('status', 'unknown')}",
+            f"  Revision：{plan.get('revision', 'unknown')}",
+            f"  当前步骤：{current_summary}",
+            "  步骤：",
+        ]
+        for index, step in enumerate(plan.get("steps", [])[:8], start=1):
+            marker = "→" if step.get("id") == current_step_id else " "
+            lines.append(
+                f"  {marker} {index}. [{step.get('status', 'unknown')}] "
+                f"{_shorten(str(step.get('description', '')), 200)}"
+            )
+        self._write("\n".join(lines))
+
+    def print_no_plan(self) -> None:
+        self._stop_status()
+        self._write("当前会话还没有任务计划。")
+
+    def print_no_active_task(self) -> None:
+        self._stop_status()
+        self._write("当前没有可取消的活动计划任务。")
+
+    def print_task_cancelled(self, plan: dict) -> None:
+        self._stop_status()
+        self._write(
+            "已取消当前计划任务并清除 Checkpoint："
+            f"{_shorten(str(plan.get('goal', '')), 200)}"
+        )
+
+    def print_cancel_error(self, error: object) -> None:
+        self._stop_status()
+        self._write(
+            "取消任务失败："
+            f"{_shorten(str(error), 400)}。"
+            "任务与 Checkpoint 已保留。"
+        )
+
     def print_unknown_command(self, command: str) -> None:
         self._write(f"未知命令：{command}。输入 /help 查看可用命令。")
 
@@ -214,6 +359,57 @@ class TerminalUI:
     def print_exit(self) -> None:
         self._stop_status()
         self._write("已退出。")
+
+    def print_checkpoint_available(self, path: object) -> None:
+        self._stop_status()
+        self._write(
+            "检测到尚未完成的计划任务，已拒绝启动新任务。\n"
+            f"Checkpoint：{path}\n"
+            "请运行 `python main.py --resume` 恢复该任务。"
+        )
+
+    def print_checkpoint_restored(self, state: dict, path: object) -> None:
+        self._stop_status()
+        plan = state["plan"]
+        current_step = next(
+            (
+                step
+                for step in plan["steps"]
+                if step["id"] == plan["current_step_id"]
+            ),
+            None,
+        )
+        if current_step is None:
+            current_step = next(
+                (
+                    step
+                    for step in plan["steps"]
+                    if step["status"] == "pending"
+                ),
+                None,
+            )
+        current_summary = (
+            _shorten(current_step["description"], 160)
+            if current_step is not None
+            else "等待 Runtime 确认下一步"
+        )
+        self._write(
+            "已恢复计划任务：\n"
+            f"  目标：{_shorten(plan['goal'], 200)}\n"
+            f"  状态：{plan['status']}\n"
+            f"  Revision：{plan['revision']}\n"
+            f"  当前步骤：{current_summary}\n"
+            f"  Checkpoint：{path}\n"
+            "请补充阻塞信息，或输入“继续”执行。"
+        )
+
+    def print_checkpoint_error(self, error: object) -> None:
+        self._stop_status()
+        self._write(
+            "Checkpoint 恢复失败："
+            f"{_shorten(str(error), 400)}\n"
+            "原文件未被覆盖，请检查后重试。"
+        )
 
     def print_error(self, error: object) -> None:
         self._stop_status()

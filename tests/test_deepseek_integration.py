@@ -1,4 +1,7 @@
 import os
+import re
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -29,6 +32,36 @@ DEMO_TOOL_RESULT = {
 
 
 RUN_LIVE_TESTS = os.getenv("RUN_LIVE_LLM_TESTS") == "1"
+RUN_LIVE_SYSTEM_TESTS = (
+    RUN_LIVE_TESTS
+    and os.getenv("RUN_LIVE_ARXIV_TESTS") == "1"
+)
+
+LIVE_MULTI_PAPER_PLAN = {
+    "type": "plan",
+    "content": None,
+    "tool_call_id": "live-system-plan",
+    "step_descriptions": [
+        (
+            "Search separately for the exact arXiv papers 1706.03762 and "
+            "1810.04805, and retain one verified candidate for each paper."
+        ),
+        (
+            "Download the PDFs for both verified arXiv candidates, using "
+            "their exact candidate IDs."
+        ),
+        (
+            "Call retrieve_paper_chunks once for each downloaded paper to "
+            "find page-numbered evidence about its core architecture and "
+            "pre-training or training objectives."
+        ),
+        (
+            "Compare Attention Is All You Need with BERT using only the "
+            "retrieved evidence, and cite at least one page number for each "
+            "paper in the final answer."
+        ),
+    ],
+}
 
 
 @unittest.skipUnless(
@@ -111,6 +144,156 @@ Do not answer with text and do not add, remove, or merge steps.
                 if message["role"] == "assistant"
             )
         )
+
+
+@unittest.skipUnless(
+    RUN_LIVE_SYSTEM_TESTS,
+    (
+        "set RUN_LIVE_LLM_TESTS=1 and RUN_LIVE_ARXIV_TESTS=1 "
+        "to run the real multi-paper system test"
+    ),
+)
+class LiveMultiPaperSystemTests(unittest.TestCase):
+    @patch.dict(os.environ, {"LLM_PROVIDER": "deepseek"}, clear=False)
+    def test_deepseek_compares_two_real_pdfs_with_page_evidence(self):
+        goal = (
+            "Complete this exact multi-paper acceptance task. Find arXiv "
+            "papers 1706.03762 and 1810.04805, download both PDFs, retrieve "
+            "passages about their core architectures and training objectives, "
+            "then compare them in Chinese. The final comparison must name "
+            "both papers and cite at least one PDF page number for each."
+        )
+
+        with TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            checkpoint_file = temporary_root / "checkpoint.json"
+            state = create_state(goal)
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "PAPER_CACHE_DIR": str(temporary_root / "pdfs"),
+                        "PAPER_INDEX_DIR": str(temporary_root / "indexes"),
+                    },
+                    clear=False,
+                ),
+                patch(
+                    "runtime.decide_next_action",
+                    return_value=LIVE_MULTI_PAPER_PLAN,
+                ),
+            ):
+                plan_answer = run_agent(
+                    state,
+                    max_steps=1,
+                    checkpoint_file=checkpoint_file,
+                )
+
+            self.assertIn("已创建任务计划", plan_answer)
+            self.assertEqual(state["plan"]["status"], "running")
+
+            append_user_message(state, "继续执行计划，不要跳过任何步骤。")
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_CACHE_DIR": str(temporary_root / "pdfs"),
+                    "PAPER_INDEX_DIR": str(temporary_root / "indexes"),
+                },
+                clear=False,
+            ):
+                final_answer = self._run_to_completion(
+                    state,
+                    checkpoint_file,
+                )
+
+            self.assertEqual(state["plan"]["status"], "completed")
+            self.assertFalse(checkpoint_file.exists())
+            self._assert_real_tool_evidence(state)
+            self.assertIn("Attention Is All You Need", final_answer)
+            self.assertIn("BERT", final_answer)
+            page_citations = re.findall(
+                r"(?:第\s*\d+\s*页|(?:page|p\.?)\s*\d+)",
+                final_answer,
+                flags=re.IGNORECASE,
+            )
+            self.assertGreaterEqual(len(page_citations), 2)
+
+    def _run_to_completion(self, state, checkpoint_file):
+        answer = ""
+        for _ in range(2):
+            answer = run_agent(
+                state,
+                max_steps=20,
+                checkpoint_file=checkpoint_file,
+            )
+            if state["plan"]["status"] == "completed":
+                return answer
+            self.assertNotEqual(state["plan"]["status"], "blocked")
+            append_user_message(state, "继续完成当前计划。")
+        self.fail(
+            "The live multi-paper task did not complete within two turns; "
+            f"last answer: {answer}"
+        )
+
+    def _assert_real_tool_evidence(self, state):
+        tool_messages = [
+            message
+            for message in state["messages"]
+            if message["role"] == "tool"
+        ]
+        searches = [
+            message["content"]
+            for message in tool_messages
+            if message["name"] == "search_paper"
+        ]
+        downloads = [
+            message["content"]
+            for message in tool_messages
+            if message["name"] == "download_paper"
+        ]
+        retrievals = [
+            message["content"]
+            for message in tool_messages
+            if message["name"] == "retrieve_paper_chunks"
+        ]
+
+        for arxiv_id in ("1706.03762", "1810.04805"):
+            self.assertTrue(
+                any(
+                    any(
+                        paper.get("arxiv_id", "").startswith(arxiv_id)
+                        for paper in result.get("papers", [])
+                    )
+                    for result in searches
+                ),
+                f"missing real search candidate {arxiv_id}",
+            )
+            paper_id = f"arxiv:{arxiv_id}"
+            self.assertTrue(
+                any(
+                    result.get("paper_id") == paper_id
+                    and "error" not in result
+                    for result in downloads
+                ),
+                f"missing real PDF download {paper_id}",
+            )
+            matching_retrievals = [
+                result
+                for result in retrievals
+                if result.get("paper_id") == paper_id
+            ]
+            self.assertTrue(
+                any(
+                    result.get("found")
+                    and all(
+                        isinstance(match.get("page"), int)
+                        and match.get("text")
+                        for match in result.get("matches", [])
+                    )
+                    for result in matching_retrievals
+                ),
+                f"missing page-numbered retrieval evidence for {paper_id}",
+            )
 
 
 if __name__ == "__main__":

@@ -11,6 +11,12 @@ EventKind = Literal[
     "tool_finished",
     "turn_finished",
     "run_failed",
+    "plan_created",
+    "plan_step_changed",
+    "plan_replanned",
+    "task_blocked",
+    "task_cancelled",
+    "checkpoint_saved",
 ]
 
 
@@ -28,6 +34,15 @@ class AgentEvent(TypedDict, total=False):
     status: str
     error_type: str
     message: str
+    task_id: str
+    plan_revision: int
+    step_id: str
+    step_description: str
+    previous_status: str
+    step_count: int
+    replan_count: int
+    reason: str
+    checkpoint_size_bytes: int
 
 
 EventHandler = Callable[[AgentEvent], None]

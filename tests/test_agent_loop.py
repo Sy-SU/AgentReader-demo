@@ -1010,7 +1010,12 @@ class AgentV1Tests(unittest.TestCase):
     def test_cli_keeps_state_for_follow_up_messages(self):
         observed_states = []
 
-        def fake_run_agent(state, confirm_save=None, on_event=None):
+        def fake_run_agent(
+            state,
+            confirm_save=None,
+            on_event=None,
+            checkpoint_file=None,
+        ):
             self.assertTrue(callable(confirm_save))
             self.assertTrue(callable(on_event))
             observed_states.append(state)
@@ -1059,7 +1064,12 @@ class AgentV1Tests(unittest.TestCase):
             prompts.append(prompt)
             return next(answers)
 
-        def fake_run_agent(state, confirm_save=None, on_event=None):
+        def fake_run_agent(
+            state,
+            confirm_save=None,
+            on_event=None,
+            checkpoint_file=None,
+        ):
             self.assertTrue(callable(on_event))
             if len(prompts) == 1:
                 on_event(

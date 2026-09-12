@@ -30,7 +30,8 @@ LLM 决策 -> Runtime 执行 Tool -> Tool Result 写回 State -> LLM 再决策
 - V2 已通过真实 arXiv、DeepSeek 和 PDF 的端到端验收，V2.0.1 的提取正确性与
   交互式终端也已完成；V2.1 的全文覆盖、检索评测、资源测量和排序方法选择均已
   完成。V3 已完成 Plan 数据契约、Planner 输入边界、Runtime 可信 Plan 创建和最小
-  step Executor；Replan、blocked 与 Checkpoint 尚未接入。
+  step Executor、有限 Replan、blocked、版本化 Checkpoint、终端任务控制、计划生命
+  周期事件、确定性规划评测和真实多论文系统验收。
 - DeepSeek thinking Tool Calling 已支持多步回传：模型返回的 reasoning 元数据只在
   State 中作为不透明协议字段保存并回传，不会显示在普通终端或 Debug Trace 中。
 
@@ -49,6 +50,27 @@ Tool Calling 和框架无关；长期 Memory、Multi-Agent、LangGraph、MCP、�
 step-level final 才完成该 step。任务累计最多 32 次 LLM 决策和 24 次 Tool 执行。
 单个用户轮次默认最多进行 20 次 LLM 决策；如果活动 Plan 到达这个上限，Runtime
 保留计划进度并提示输入“继续”，而不是把整项任务标记为失败。
+
+Runtime 只会在 Tool 失败、搜索候选歧义、检索证据不足等可信观察出现后，临时向
+Executor 开放内部 `submit_plan`。每个任务最多 Replan 2 次；旧的 completed/failed
+步骤及 evidence reference 会保留，只替换尚未开始的后缀。缺少必要用户选择时，
+Executor 使用内部 `request_clarification`，Runtime 将任务置为 `blocked`；用户下一
+条消息会恢复同一步骤。Replan 后重复调用已经成功执行的 `save_paper` 或
+`download_paper` 时，Runtime 复用先前可信结果，不会再次产生副作用；首次保存仍
+逐篇要求终端 `y/N` 确认。
+
+活动 Plan 会在创建、步骤转换、Tool Result、Replan、blocked 和本轮暂停等一致状态
+边界原子写入 `data/checkpoints/active.json`。启动时发现该文件会拒绝覆盖并提示
+`--resume`；恢复时重新校验 Plan、消息协议、可信论文 ID、evidence reference 和
+PDF 缓存。任务完成或不可恢复失败后文件会清除，Ctrl+C、普通 Runtime 错误和
+`/exit` 则保留它。`/cancel` 先原子清除活动 Checkpoint，再把可信 Plan 置为
+`cancelled`；清除失败时任务和文件都保持原状。Checkpoint 只恢复同一个任务，不会
+召回到新任务。
+
+Runtime 还会发出 UI 无关的计划创建、步骤状态转换、Replan、阻塞、取消和
+Checkpoint 保存事件。终端只消费这些深拷贝事件，不拥有 Plan 状态。离线
+`evaluate_planning.py` 通过真实 Runtime 和受控 Provider/Tool 运行固定的两论文流程，
+输出任务完成、Replan、LLM/Tool 次数和 Checkpoint 大小等机器可读指标。
 
 详细范围和信息流见：
 
@@ -106,14 +128,26 @@ DeepSeek 请求默认显式使用 `DEEPSEEK_THINKING=enabled` 和
 
 thinking 模式下，Provider 返回的 `reasoning_content` 或 `reasoning_details` 会随
 对应 Assistant 消息保留并在后续请求中原样回传。这是 Tool Calling 消息协议的一
-部分，不是文献证据，也不会作为 Debug 内容输出。Checkpoint 尚未实现；是否把该
-字段持久化会在恢复功能开始前单独评估。
+部分，不是文献证据，也不会作为 Debug 内容输出。活动任务的 Checkpoint 会保存这
+一不透明字段，因为恢复后的下一次 thinking 请求仍必须完整回传它；4 MiB 总上限和
+结构校验同时限制其持久化大小。
 
 ## 运行
 
 ```bash
 python main.py
 ```
+
+如果上一次复合任务尚未完成，使用：
+
+```bash
+python main.py --resume
+```
+
+不带 `--resume` 启动时若发现活动 Checkpoint，程序会在读取新任务前退出，避免覆盖
+旧任务。恢复成功后只显示目标、状态、revision 和当前步骤；不会打印历史消息或
+reasoning。输入“继续”执行 running 任务；blocked 任务应直接补充 Agent 请求的
+信息。`/exit` 会保留任务，任务完成后自动清除 Checkpoint。
 
 程序会在每次 Agent 回答后继续等待输入，并把新消息追加到同一个 State。
 例如 Agent 发现多个 TASA 候选后，可以直接回复 `第 1 篇`。交互终端使用
@@ -127,8 +161,14 @@ python main.py
 /debug          切换 Debug 模式
 /debug on|off   开启或关闭 Debug 模式
 /clear          清空当前会话 State
+/plan           查看当前任务的有界 Plan 摘要
+/cancel         取消当前活动任务并清除 Checkpoint
 /exit           退出 AgentReader
 ```
+
+活动计划存在时 `/clear` 会被拒绝，避免丢失可恢复状态。此时普通消息会继续补充或
+推进同一任务；要开始无关任务，应先完成当前任务或使用 `/cancel`。`/plan` 只显示
+有界目标、revision、状态和步骤，不把消息历史或 reasoning 打印出来。
 
 普通文本 `exit`、`quit`、`退出` 和 Ctrl+D 也可以退出。输入阶段按 Ctrl+C 会取消
 当前输入，不会退出整个会话。
@@ -150,6 +190,9 @@ python main.py --plain --debug
 非 TTY 输入输出会自动使用 Plain 模式。增强模式的命令历史只保存在当前进程内，
 不会默认把用户查询写到磁盘。非交互管道发生运行错误时返回非零退出码。
 
+Checkpoint 默认位于 `data/checkpoints/active.json`，最大 4 MiB，并已被 Git 忽略。
+测试或隔离运行可通过 `AGENT_READER_CHECKPOINT_PATH` 指定其他路径。
+
 ## 测试
 
 请在项目根目录使用 `python -m unittest ...` 启动测试，不要直接执行
@@ -169,6 +212,17 @@ python evaluate_retrieval.py
 python evaluate_retrieval.py --json
 ```
 
+运行固定的两论文 Planning/Checkpoint 评测（同样不会访问网络或模型）：
+
+```bash
+python evaluate_planning.py
+python evaluate_planning.py --json
+```
+
+当前确定性快照为：任务完成、0 次 Replan、6 次 LLM 决策、2 次 Tool 执行、13 次
+Checkpoint 保存，最大 Checkpoint 为 4,572 B。评测通过正式 Runtime 执行，只有
+Provider 响应和文献 Tool 数据被固定，因此适合发现状态机或持久化回归。
+
 显式运行真实搜索测试（会先请求 arXiv，失败或无结果时请求 Crossref）：
 
 ```bash
@@ -176,8 +230,8 @@ RUN_LIVE_ARXIV_TESTS=1 python -m unittest \
   tests.test_arxiv_integration -v
 ```
 
-显式运行 DeepSeek 在线测试（包含普通 Tool Loop 和 thinking 多步 Plan，会产生
-真实 API 请求）：
+显式运行 DeepSeek 在线测试（包含普通 Tool Loop 和 thinking 多步 Plan；仅设置这个
+开关时，真实 PDF 多论文验收仍按设计跳过）：
 
 ```bash
 RUN_LIVE_LLM_TESTS=1 python -m unittest \
@@ -194,6 +248,12 @@ RUN_LIVE_LLM_TESTS=1 python -m unittest \
 RUN_LIVE_ARXIV_TESTS=1 RUN_LIVE_LLM_TESTS=1 \
   python -m unittest discover -s tests -v
 ```
+
+同时设置两个开关后还会执行真实多论文系统用例：固定高层计划后，由 DeepSeek 通过
+正式 Executor 分别搜索 arXiv:1706.03762 与 arXiv:1810.04805、下载两份真实 PDF、
+检索两边的页码证据并生成比较。固定计划用于降低模型规划措辞的偶然性；Executor、
+Provider、网络、PDF 索引和证据校验均为真实生产路径。2026-09-13 的完整验收为
+202 项测试全部通过、0 跳过。
 
 环境变量开关仍然保留，使普通离线开发或没有 API Key 的 CI 不会意外访问网络和
 产生模型费用；Codex 后续进行完整验收时使用上面的联网命令。

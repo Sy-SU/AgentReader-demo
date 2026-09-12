@@ -423,7 +423,7 @@ conversation ID、step、tool name、duration、result status、retry count、to
 | JSON 文献库 | 低成本验证持久化 | 数据库事务、锁、索引、迁移、备份和审计 |
 | 本地 PDF 缓存 | 便于练习安全下载 | 流式下载、哈希、对象存储、配额和生命周期 |
 | 手工 Debug Trace | 学习价值高 | 结构化 tracing、指标、日志脱敏和成本监控 |
-| 手工真实验收 | 快速发现行为问题 | 固定 eval 数据集、基线、阈值和回归报告 |
+| 自动化真实验收 | 真实发现 Provider、网络与 PDF 链路问题 | 固定高层场景、显式开关、结构断言和回归报告 |
 
 ### 5.4 当前 Review 发现的技术债务
 
@@ -435,7 +435,7 @@ conversation ID、step、tool name、duration、result status、retry count、to
 - arXiv 一旦返回候选，即使词法相关性很弱也不会再比较 Crossref；
 - Tool Schema、Python 签名和文档由人工同步，缺少自动契约一致性检查；
 - `SEARCH_PAPER_SCHEMA` 的描述仍需随本地重排语义保持同步；
-- 真实 DeepSeek 测试 Mock 了搜索层，完整真实链路目前依赖手工 Trace；
+- 普通 DeepSeek 协议测试仍 Mock 搜索层，但已另有真实 arXiv + 双 PDF 系统用例；
 - 尚无 OpenRouter 真实冒烟测试和 Provider 行为兼容矩阵；
 - 已有小型离线段落检索基线，但还没有真实论文规模的搜索质量集、Prompt 回归评测
   或语义检索基线；
@@ -445,8 +445,9 @@ conversation ID、step、tool name、duration、result status、retry count、to
 - PDF URL 检查拒绝显式私有 IP，但真实系统还要处理 DNS 解析和重绑定风险；
 - V1、V2 和 V2.1 已形成独立提交；后续版本仍应保持小而可回滚的阶段提交。
 
-V2.1 已完成全文覆盖和检索评测。下一阶段优先建立显式任务状态、预算和恢复边界，
-再评估长期 Memory、Graph 或 Multi-Agent。
+V3 已完成显式任务状态、预算、恢复、终端控制、事件和规划评测。下一阶段应先根据
+V3 真实使用结果选择一个明确问题，再评估 Context 压缩、检索升级或其他能力；不因
+版本号自动引入长期 Memory、Graph 或 Multi-Agent。
 
 ## 6. 可复用检查清单
 
@@ -586,9 +587,9 @@ V2.1 已完成全文覆盖和检索评测。下一阶段优先建立显式任务
 
 ### 7.5 V3：可恢复的单 Agent 计划执行器
 
-- **状态**：Plan 纯数据层、Planner 输入边界、Runtime 可信 Plan 创建、最小 Executor
-  和 DeepSeek thinking 多步消息协议已经完成；Replan、blocked 与 Checkpoint 尚未
-  接入。
+- **状态**：已完成。Plan、Planner、Executor、DeepSeek thinking 协议、有限 Replan、
+  blocked、Checkpoint/`--resume`、终端控制、生命周期事件、规划评测和真实多论文
+  验收均已接入。
 - **阶段目标**：让单 Agent 把多论文、多交付结果的用户目标拆成显式 Plan，串行执行
   当前步骤，在有限条件下 Replan，并在进程退出后恢复同一个未完成任务。
 - **目标示例**：搜索两个方向的代表论文，下载 PDF，分别检索方法与实验结果，再
@@ -610,8 +611,8 @@ V2.1 已完成全文覆盖和检索评测。下一阶段优先建立显式任务
   任务不能静默覆盖尚未恢复的活动文件。
 - **关键概念**：Checkpoint 是 operational state persistence；长期 Memory 是新任务
   中的选择性召回。V3 只实现前者，避免把“磁盘上有 JSON”误称为 Agent Memory。
-- **终端行为**：计划增加 `/plan`、`/cancel` 和 `--resume`；活动任务存在时 `/clear`
-  不得静默丢弃 Checkpoint。
+- **终端行为**：`--resume`、活动任务 `/clear` 保护、`/plan` 有界查看和 `/cancel`
+  原子取消均已完成；普通消息在活动期间只进入同一个 State。
 - **非目标**：LangGraph、Multi-Agent、MCP、长期 Memory、Embedding/Vector DB、
   跨语言语义检索、并发 Tool Calling、后台任务和复杂异步调度。
 - **验收标准**：离线覆盖成功、非法 Plan、阻塞、有限 Replan、预算、取消、损坏
@@ -658,13 +659,49 @@ V2.1 已完成全文覆盖和检索评测。下一阶段优先建立显式任务
   `max_steps=5`，状态虽然保留，但英文 `Agent stopped` 容易被理解成任务失败。
   默认值调整为 20，仍低于任务级 32 次 LLM 决策上限；活动 Plan 真正到限时改为
   中文说明本轮暂停并提示输入“继续”，不改变 Plan 状态和任务预算。
-- **下一小步**：实现有限 Replan 与 `blocked`，并继续保留 Runtime 对状态、预算、
-  evidence 和副作用权限的独占写入。
+- **Replan/blocked 结果**：Runtime 只根据最新未处理的可信 Tool Result 开放一次
+  Replan 选择；普通成功观察不能再次规划。`revise_plan()` 保留 completed/failed
+  历史、attempts 和 evidence，只替换 pending 后缀，并把任务限制在 2 次 Replan 和
+  8 个总步骤内。`request_clarification` 作为内部控制动作进入 blocked，只有新的用户
+  消息才能恢复原步骤。单轮上限正好落在失败 Tool Result 后时，该失败信号也可跨
+  “继续”保留。
+- **副作用结果**：Replan 后相同参数的成功 `save_paper` / `download_paper` 调用由
+  Runtime 复用可信旧结果，不再次执行 Tool；用户拒绝和错误结果不会被当作成功复用。
+  首次保存的逐篇 `y/N` 确认与原始目标权限边界保持不变。
+- **验证结果**：新增 2 项 Plan、3 项 Executor 和 9 项 Runtime 用例，覆盖重规划
+  条件、2 次预算、动态容量、失败跨轮恢复、blocked 恢复、硬失败收敛、软歧义和
+  重复下载及失效缓存保护。真实 arXiv + DeepSeek 全量 170 项通过，无跳过。
+- **Checkpoint 结果**：新增独立 `checkpoint.py`，用版本 1、4 MiB 上限、同目录唯一
+  临时文件、`fsync` 与原子替换保存活动 State。加载会重新验证 Plan、消息配对、
+  evidence、稳定论文 ID 和 PDF 缓存；不同 task、损坏、超限或不兼容版本均拒绝且
+  不覆盖旧文件。thinking reasoning 因 Provider 恢复协议需要而随 State 保存，但不
+  进入终端输出。
+- **恢复结果**：Runtime 在 Plan 创建和每个一致状态边界保存，在完成或不可恢复失败
+  后清除；Ctrl+C、可恢复错误和退出保留最近快照。CLI 启动拒绝静默覆盖，`--resume`
+  只显示有界摘要并继续同一 `task_id`。活动任务的 `/clear` 已被阻止。
+- **Checkpoint 验证结果**：完整联网回归 190 项全部通过、无跳过；覆盖原子写失败、
+  损坏/版本/超限、可信 ID/evidence 篡改、缓存失效、running/blocked 恢复、Ctrl+C、
+  完成/失败清理和 CLI 冲突提示。
+- **终端与事件结果**：`/plan` 有界显示 Runtime-owned Plan；`/cancel` 先清理
+  Checkpoint 再提交取消状态，失败时不留下半取消。新增计划创建、步骤转换、Replan、
+  blocked、cancelled 和 Checkpoint 保存事件；事件不含 reasoning、路径或完整 State，
+  终端继续作为只读观察者。
+- **规划评测结果**：`evaluate_planning.py` 用正式 Runtime、受控 Provider/Tool 执行
+  固定两论文成功流程。当前机器可读快照为 completed=true、Replan=0、LLM=6、
+  Tool=2、Checkpoint 保存 13 次、最大 4,572 B。
+- **真实系统验收结果**：测试用受控四步 Plan 降低规划输出随机性，Executor 与
+  DeepSeek、arXiv:1706.03762、arXiv:1810.04805、双 PDF 下载、全文索引、页码证据和
+  最终比较均走真实路径。2026-09-13 全量联网 202 项全部通过、无跳过。
+- **下一小步**：提交 V3 工作后进行一次版本复盘；只有从真实使用或评测中识别出
+  明确瓶颈，再与用户共同定义下一版本需求。
 
 ## 8. 更新记录
 
 | 日期 | 阶段 | 更新内容 | 证据 |
 |---|---|---|---|
+| 2026-09-13 | V3 完成 | `/plan`、`/cancel`；计划生命周期事件；确定性 Planning 评测；真实双论文 PDF 验收 | 规划快照 completed=true、Replan=0、LLM=6、Tool=2、Checkpoint 最大 4,572 B；真实 arXiv + DeepSeek 全量 202 项通过、无跳过 |
+| 2026-09-13 | V3 Checkpoint/恢复 | 版本化原子快照；严格恢复校验；`--resume`；冲突保护；活动任务 `/clear` 保护 | 真实 arXiv + DeepSeek 全量 190 项通过、无跳过 |
+| 2026-09-13 | V3 Replan/blocked | 可信失败条件下有限重规划；保留历史/evidence；用户澄清阻塞恢复；重复副作用复用 | 新增 14 项测试；真实 arXiv + DeepSeek 全量 170 项通过、无跳过 |
 | 2026-09-12 | V3 单轮执行上限 | 默认 `max_steps` 从 5 调整为 20；活动 Plan 到限时保留状态并提示继续 | 新增 1 项默认值测试；真实 arXiv + DeepSeek 全量 156 项通过、无跳过；任务级 32/24 预算不变 |
 | 2026-09-12 | V3 DeepSeek thinking 协议 | 显式 thinking 配置；跨 Plan、Tool Call 和 step final 原样回传 reasoning；OpenRouter 格式兼容；终端不显示推理字段 | 13 项新增测试；真实 arXiv + DeepSeek 全量 155 项通过、无跳过 |
 | 2026-09-12 | V3 最小 Executor | 当前 step 控制 Context、串行 Tool Loop、step-level final、可信 evidence 和执行前预算边界 | 7 项新增测试；真实 arXiv + DeepSeek 全量 142 项通过、无跳过 |

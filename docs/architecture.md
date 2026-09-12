@@ -11,22 +11,21 @@ main.py 解析 Slash Command，创建或复用 State
   ↓
 runtime.py 启动循环
   ├─ 结构化 Runtime Event → terminal.py 实时渲染
-  │
-  ↓
-agent.py 组装 instructions + messages + Tool Schemas
-  ↓
-llm.py 调用 Fake / DeepSeek / OpenRouter
-  ├─ tool_call → Runtime 校验并执行 Tool
-  │                  ↓
-  │            Tool Result 写入 State
-  │                  ↓
-  │            回到下一次 LLM 决策
-  │
-  └─ final → terminal.py 输出本轮答案 → 等待下一条用户消息
-                               ↓
-                         追加到同一个 State
-                               ↓
-                         Runtime 开始下一轮
+  ├─ 无活动 Plan → planner.py 首次选择 plan | tool_call | final
+  ├─ 活动 Plan → planning.py 启动可信 step → executor.py 决策
+  └─ 简单任务后续决策 → agent.py
+             ↓
+  llm.py 调用 Fake / DeepSeek / OpenRouter
+             ├─ tool_call → Runtime 校验并执行 Tool
+             │                  ↓
+             │            Tool Result 写入 State/Plan evidence
+             │                  ↓
+             │            回到下一次 LLM 决策
+             └─ final → 完成当前 step 或本轮
+                                      ↓
+                           terminal.py 输出并等待输入
+                                      ↓
+                              追加到同一个 State
 ```
 
 这个结构故意不使用 Agent 框架，便于直接观察每次状态变化。
@@ -35,10 +34,12 @@ llm.py 调用 Fake / DeepSeek / OpenRouter
 
 ### `main.py`
 
-- 解析 `--debug` 和 `--plain`。
+- 解析 `--debug`、`--plain` 和 `--resume`。
 - 组合 Terminal、State 和 Runtime，但不包含具体显示实现。
+- 启动时检测唯一活动 Checkpoint；普通启动拒绝覆盖，`--resume` 校验后恢复 State。
 - 第一轮创建 State，后续轮次向同一个 State 追加用户消息。
-- 处理 `/help`、`/debug`、`/clear`、`/exit`；这些命令不会写入 State。
+- 处理 `/help`、`/debug`、`/clear`、`/plan`、`/cancel`、`/exit`；这些命令不会
+  写入 State。
 - 空输入重新提示；`/exit`、`exit`、`quit`、`退出` 或 EOF 结束会话。
 - 交互模式的可恢复运行错误不会关闭会话；非交互模式以非零状态码退出。
 - 不包含 Agent 决策或 Tool 实现。
@@ -50,12 +51,19 @@ llm.py 调用 Fake / DeepSeek / OpenRouter
 - 非 TTY 或 `--plain` 时退回无 ANSI 控制序列的纯文本界面。
 - 把 Tool Result 转成有界显示摘要；Debug 预览不修改 State 中的原始数据。
 - 展示可信待保存论文并读取确定性的 `y/N` 确认。
+- 有界显示 Checkpoint 冲突、恢复摘要和校验错误，不显示消息历史或 reasoning。
+- 有界显示 Runtime-owned Plan，并渲染计划创建、步骤转换、Replan、阻塞、取消和
+  Checkpoint 保存事件。
 - 只负责输入与显示，不执行 Tool，也不决定授权策略。
 
 ### `events.py`
 
 - 定义 UI 无关的 `AgentEvent` 和可选 `EventHandler` 类型。
-- 事件描述 Runtime 生命周期，不包含 Rich 或 Prompt Toolkit 对象。
+- 事件描述 LLM/Tool 以及 Plan 创建、步骤转换、Replan、阻塞、取消和 Checkpoint
+  保存生命周期，不包含 Rich 或 Prompt Toolkit 对象。
+- Plan 生命周期事件只携带现有契约约束下的 metadata，不包含 reasoning、完整 State
+  或 Checkpoint 路径；Tool 事件仍提供真实结果，终端负责有界显示。Runtime 向所有
+  观察者发送深拷贝。
 
 ### `state.py`
 
@@ -64,7 +72,7 @@ llm.py 调用 Fake / DeepSeek / OpenRouter
 - Assistant 消息可带一份归一化的 `reasoning_content` 或
   `reasoning_details`；State 只为后续 Provider 协议回传保存它，不解释其内容。
 - 提供追加后续用户消息的最小操作。
-- 当前没有跨任务 Memory。
+- 活动 Plan 可以通过 Checkpoint 跨进程恢复；当前没有跨任务 Memory。
 
 ### `agent.py`
 
@@ -104,16 +112,32 @@ Runtime 只保存 `llm.py` 已归一化的不透明协议字段。
 - 执行 Tool，并将结果或结构化错误写回 State。
 - 将每次归一化模型响应的 reasoning 元数据附着到对应 Assistant State 消息，使
   `llm.py` 能在下次请求中恢复完整的 thinking Tool Calling 历史。
-- 通过可选回调发出 LLM、Tool、结束和失败事件；发给观察者的是深拷贝，回调异常
-  不得改变 Agent Loop。
+- 通过可选回调发出 LLM、Tool、Plan、Checkpoint、结束和失败事件；发给观察者的是
+  深拷贝，回调异常不得改变 Agent Loop。
 - 在 LLM 或 Tool 被用户中断时补齐消息协议，并用 `cancelled` 状态结束当前轮。
 - 更新累计 step，处理本轮 final，并用每轮默认 20 次的 `max_steps` 阻止无限循环；
   活动 Plan 到限时保留进度并提示用户输入“继续”。
+- 在 Plan 创建、步骤转换、Tool Result、Replan、blocked 和暂停等一致边界保存活动
+  Checkpoint；完成或不可恢复失败后清除。可恢复异常沿用最近有效快照。
+- `/cancel` 通过独立 Runtime 入口执行：先清除活动 Checkpoint，再提交 cancelled
+  Plan；清除失败时不修改 State。
 
 Runtime 是执行和约束层。它限制保存、下载和提取操作只能引用当前任务中的可信
 Tool Result，并强制保存操作必须经过人工确认。`terminal.py` 负责具体终端交互，
 `main.py` 负责组合各层，Runtime 负责执行确认和来源校验策略；具体 Tool 不读取
 用户输入。
+
+### `checkpoint.py`
+
+- 解析默认路径 `data/checkpoints/active.json` 或测试用路径覆盖。
+- 只保存结构有效的 `running|blocked` State，格式版本为 1、上限为 4 MiB。
+- 使用同目录唯一临时文件、`fsync` 和 `os.replace`，写入失败保留上一份文件。
+- 加载时重新验证 Plan、消息配对、可信 ID、evidence reference 和 PDF 缓存。
+- 拒绝不同 `task_id` 覆盖活动文件；提供幂等清理，但不决定何时取消任务。
+- 保存 messages 中 Provider 恢复所需的 reasoning 元数据，不解析或显示它。
+
+该模块不知道 LLM、Planner 或终端。Checkpoint 写入时机由 Runtime 决定，启动恢复
+策略由 `main.py` 决定。
 
 ### `tools/`
 
@@ -141,8 +165,10 @@ Tool 包通过 `tools/__init__.py` 暴露稳定公共接口，调用方继续使
   `--compare` 同数据集方法对比。
 - `evals/resources.py` 在隔离目录生成合成 PDF，测量首次检索、缓存检索、磁盘索引
   和 top-k Tool Result；`measure_retrieval_resources.py` 是对应命令行入口。
-- 评测路径不进入 Runtime 或 Agent Loop，不调用 LLM、网络和磁盘索引缓存，也不
-  创建或恢复会话 State。资源基准只使用自己在临时目录创建的缓存。
+- `evals/planning.py` 使用正式 Runtime 和 Checkpoint，固定 Provider 响应与 Tool
+  数据执行确定性的两论文任务；`evaluate_planning.py` 输出人类报告或 JSON 指标。
+- 检索质量评测不进入 Runtime 或 Agent Loop；Planning 评测则刻意经过正式 Runtime，
+  但不调用真实 LLM 或网络。资源基准只使用自己在临时目录创建的缓存。
 
 ## 3. 内部消息协议
 
@@ -195,6 +221,16 @@ llm_started → llm_finished
                   └─ tool_call → tool_started → Tool Result 写入 State
                                       ↓
                                 tool_finished → 下一 step
+```
+
+活动 Plan 还会在可信状态边界发出：
+
+```text
+plan_created
+plan_step_changed: pending → running → completed|blocked|failed
+plan_replanned
+task_blocked | task_cancelled
+checkpoint_saved
 ```
 
 未处理异常发出 `run_failed` 后仍向调用方抛出。事件是显示与执行之间的只读边界，
@@ -819,7 +855,7 @@ TF-IDF 持平；50% 查询词覆盖门槛消除了固定集中的通用词无答
 中文查询无法直接召回英文正文。V3 不直接引入高级 Agent 框架，而是在当前结构上
 增加可观察、可测试的计划控制层。
 
-## 11. V3 计划架构（最小 Executor 已实现）
+## 11. V3 计划架构（已实现）
 
 V3 的目标信息流是：
 
@@ -846,16 +882,18 @@ checkpoint.py：每个重要状态转换后原子保存
 - `planning.py`：已定义纯数据 Plan 契约、常量、验证器和状态转换；不调用模型、不
   执行 Tool、不写文件，而且每次转换返回新的 Plan 值。
 - `planner.py`：已定义内部 `submit_plan` Schema、首次规划 instructions 和响应
-  归一化；后续再为已授权的 Replan 组装目标、当前 Plan 和必要结果摘要。它不直接
-  修改 State。
+  归一化；它不直接修改 State。
 - `executor.py`：已根据可信 Plan 组装任务目标、已完成步骤和当前 step 的有界控制
-  Context，并复用现有 Tool Schemas 请求一次 `tool_call|final`；不修改 State。
-- `checkpoint.py`：校验并原子保存/读取活动任务 Checkpoint；不知道 LLM 或 Tool。
+  Context，并复用现有 Tool Schemas 请求一次 `tool_call|final`；需要用户输入时还可
+  返回内部 blocked 动作。只有 Runtime 授权时才临时加入动态收紧后的
+  `submit_plan` Schema；Executor 不修改 State。
+- `checkpoint.py`：已校验并原子保存/读取活动任务 Checkpoint；不调用 LLM 或执行
+  Tool，但会复用稳定 ID 与 PDF 缓存校验规则。
 - `state.py`：已增加可为空的任务 ID 和 Plan；预算计数器与证据引用保存在 Plan 中。
-- `runtime.py`：已接入第一次 Planner 决策、可信 Plan 创建、串行 Executor、预算计数
-  和 evidence reference；后续仍负责 Replan 条件、Checkpoint 时机和副作用授权。
-- `main.py` / `terminal.py`：组合 `--resume`、`/plan`、`/cancel` 和事件显示，不修改
-  Plan 业务状态。
+- `runtime.py`：已接入第一次 Planner 决策、可信 Plan 创建、串行 Executor、预算计数、
+  evidence reference、Replan 条件、blocked 恢复、重复副作用保护和 Checkpoint 时机。
+- `main.py` / `terminal.py`：已组合 `--resume`、有界恢复提示、`/plan`、`/cancel`
+  和计划事件显示；显示层不修改 Plan 业务状态。
 
 Planner 使用仅供结构化输出的 `submit_plan` Schema。它不是外部 Tool，不进入
 `tools/` 包或 `TOOL_REGISTRY`，也不会被“执行”；`planner.py` 只读取归一化
@@ -913,6 +951,40 @@ Tool Call ID 来自 Provider，不能直接作为可信 evidence reference。Run
 可以反向定位真实 Tool Result。LLM 与 Tool 预算都在调用前检查，达到上限后任务进入
 `failed`，不会先产生第 33 次 LLM 调用或第 25 次 Tool 执行。
 
+当前 Replan 链路为：
+
+```text
+Tool Result
+  → Runtime 分类最新未处理观察
+  → 无问题：Executor 不能看到 submit_plan
+  → 失败/歧义/证据不足，且仍有预算和 Plan 容量
+      → Executor 临时看到 submit_plan
+      → 模型选择普通 Tool/final：继续当前步骤
+      → 模型选择 submit_plan
+          → fail_current_step
+          → revise_plan：保留 completed/failed 历史和 evidence
+          → 替换旧 pending 后缀并增加 revision/replans
+          → 启动新的 pending step
+```
+
+硬失败包括结构化 Tool 错误、搜索无候选或无词法匹配、检索无有效片段、PDF 无可
+提取文本和空文献库。搜索返回多个候选但没有精确标题匹配时属于软歧义：Runtime
+允许 Replan，但如果当前 step 的目标只是展示候选，模型也可以正常结束该步骤。
+`submit_plan` 的 `maxItems` 会根据保留历史动态缩小；Plan 总步数仍不能超过 8，
+任务最多 Replan 2 次。
+
+缺少候选选择等关键输入时，Executor 调用内部 `request_clarification`。它不会进入
+Tool Registry；Runtime 把当前 step 和任务都标为 blocked，并把模型生成的一个有界
+问题返回用户。只有 State 最后一条消息是新的 user 消息时，blocked step 才恢复为
+running，attempts 增加后继续执行。硬失败后的普通 final 也不能误完成步骤，而会由
+Runtime 收敛到 blocked。
+
+为了防止新计划重复副作用，Runtime 在执行 `save_paper` 或 `download_paper` 前按
+Tool 名和规范参数查找已成功的可信 Tool Result。命中后复制旧结果并增加
+`runtime_reused` 标记，不再次调用 Tool，也不再次请求保存确认。这个保护只复用成功
+或已经存在的结果；下载结果还必须重新通过本地缓存校验。用户拒绝、审批异常、
+失效缓存和 Tool 错误不会被当作可复用成功结果。
+
 ### 11.2 计划状态
 
 ```python
@@ -946,7 +1018,9 @@ Checkpoint 不复制 PDF、全文索引或 Tool 内部数据。
 
 步骤的正常转换是 `pending → running → completed|blocked|failed`。`blocked` 表示缺少
 继续执行所需的用户信息，因此只允许在用户补充信息后恢复为 `running`；恢复会增加
-一次 attempts。终态步骤不能由模型自行回退。
+一次 attempts。Replan 后 failed 步骤作为不可变历史保留；其数量与已使用 Replan
+次数必须一致，最多只允许一个尚未解决的 failed 步骤。新后缀完成后，任务可以在
+保留 failed 历史的同时进入 completed。终态步骤不能由模型自行回退。
 
 ### 11.3 Checkpoint 与 Memory 的边界
 
@@ -957,10 +1031,17 @@ Long-term Memory = 在新任务中选择性召回过去信息
 
 V3 只实现前者。默认只存在一个 `data/checkpoints/active.json`，并设格式版本和
 4 MiB 上限。`--resume` 恢复前重新验证结构、可信 ID 与本地缓存；完成、不可恢复
-失败或明确取消后清除活动 Checkpoint。启动时存在活动文件就提示恢复，新任务不能
-静默覆盖它。任何 Checkpoint 内容都不会自动注入新的任务 Context。
+失败后清除活动 Checkpoint；显式 `/cancel` 先调用同一清理函数，成功后才将 Plan
+转为 cancelled。启动时存在活动文件就提示恢复，新任务不能静默覆盖它。任何
+Checkpoint 内容都不会自动注入新的任务 Context。
 
-### 11.4 实现顺序
+Checkpoint 记录完整 State，包括 Plan 计数器、Tool Result、evidence reference 和
+Provider 继续请求所需的不透明 reasoning 字段；不记录 API Key、PDF 二进制、完整
+索引或 Tool 未返回的数据。写入只发生在消息协议平衡、Plan 已通过校验的边界。恢复
+后的 Executor 从保存的 `current_step_id` 继续；已完成步骤不会重新执行，成功的保存
+或下载仍由 Runtime 幂等保护复用。
+
+### 11.4 实现顺序（全部完成）
 
 ```text
 Plan 纯数据契约与状态机
@@ -974,3 +1055,16 @@ Plan 纯数据契约与状态机
 ```
 
 开发和复盘方法见 `docs/agent-development-process.md`。
+
+### 11.5 评测与真实验收
+
+确定性 Planning 评测固定两篇论文数据和 6 个模型动作，但实际调用 Runtime、Plan
+状态转换、Tool Registry 和原子 Checkpoint。当前快照为任务完成、0 次 Replan、
+6 次 LLM 决策、2 次 Tool 执行、13 次 Checkpoint 保存、最大文件 4,572 B。它用于
+发现控制流和持久化回归，不用于衡量模型答案质量。
+
+真实系统测试固定四步高层 Plan，以减少 Planner 措辞和步数的随机性；后续步骤由
+DeepSeek 通过正式 Executor 决策，并真实搜索 arXiv:1706.03762 与 arXiv:1810.04805、
+下载两份 PDF、建立全文索引、取得两边带页码的片段并生成比较。测试还校验两篇的
+可信 ID、下载结果、页码与文本证据以及最终回答的双论文页码引用。2026-09-13 的
+全量联网结果为 202 项通过、0 跳过。
