@@ -189,6 +189,7 @@ def main(
             final_answer = run_agent(state, **run_options)
         except (RuntimeError, ValueError) as error:
             terminal.report_unhandled_error(error)
+            terminal.print_execution_evaluation()
             if not terminal.interactive:
                 raise SystemExit(1) from error
             continue
@@ -197,6 +198,7 @@ def main(
             continue
 
         terminal.print_answer(final_answer)
+        terminal.print_execution_evaluation()
 
 
 def _has_active_plan(state: dict | None) -> bool:

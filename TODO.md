@@ -434,3 +434,28 @@ thinking 和双 PDF 系统用例。
 
 V3 完成后再根据实际评测决定下一项能力，而不是自动把所有高级 Agent 概念加入
 项目。
+
+---
+
+## 9. V3.1：分层评测机制（已完成）
+
+目标是把“代码/控制流是否健康”和“检索结果是否正确”分开测量，避免用一个没有
+gold answer 的主观数字概括 Agent。
+
+- [x] Debug 模式按单轮 Runtime Event 输出 0–100 运行健康分。
+- [x] 分别显示本轮控制、协议完整性、Tool 成功率和预算健康度。
+- [x] 用户取消不评分；Tool error、预算耗尽、协议不完整和 Runtime failure 可见。
+- [x] 明确健康分不等于答案正确率，也不读取或评判 reasoning 内容。
+- [x] 选择已有科学文献检索 benchmark LitSearch，而不是自造生产准确率。
+- [x] 实现官方 JSON/JSONL 结果兼容层，支持文档级 ID 和 paragraph tuple 输出。
+- [x] 按官方协议报告 broad Recall@20、specific Recall@5/20，并支持 JSON 报告。
+- [x] 默认 scorer 离线运行，不下载完整数据、不调用模型或网络。
+- [x] 增加评分纯函数、输入校验、CLI 与 Debug 集成测试并同步项目文档。
+
+边界：LitSearch 的可比结果必须来自同一固定 corpus，并使用 Semantic Scholar
+corpus ID。AgentReader 当前在线源使用 arXiv ID/DOI 且只返回 Top-3，因此 Debug
+健康分不能冒充 LitSearch Recall；后续若增加相同 corpus 的检索适配器，应直接复用
+本阶段 scorer。
+
+验收结果：2026-09-13 在 `agent-reader-demo` Conda 环境中启用真实 arXiv 与
+DeepSeek，完整 219 项测试全部通过、0 跳过。

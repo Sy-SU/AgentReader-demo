@@ -178,8 +178,13 @@ Tool 包通过 `tools/__init__.py` 暴露稳定公共接口，调用方继续使
   和 top-k Tool Result；`measure_retrieval_resources.py` 是对应命令行入口。
 - `evals/planning.py` 使用正式 Runtime 和 Checkpoint，固定 Provider 响应与 Tool
   数据执行确定性的两论文任务；`evaluate_planning.py` 输出人类报告或 JSON 指标。
+- `evals/execution.py` 只保留 Runtime Event 的有界计数，在 Debug turn 结束后计算
+  控制、协议、Tool 和预算四维运行健康分；`terminal.py` 只负责渲染该报告。
+- `evals/litsearch.py` 读取 LitSearch 官方 retrieval result 记录并复用其 corpus ID
+  Recall@K 定义；`evaluate_litsearch.py` 输出官方 broad/specific cutoff 或 JSON。
 - 检索质量评测不进入 Runtime 或 Agent Loop；Planning 评测则刻意经过正式 Runtime，
-  但不调用真实 LLM 或网络。资源基准只使用自己在临时目录创建的缓存。
+  但不调用真实 LLM 或网络。运行健康评分观察正式 Runtime Event，但不反向控制
+  Runtime。资源基准只使用自己在临时目录创建的缓存。
 
 ## 3. 内部消息协议
 
@@ -1085,3 +1090,38 @@ DeepSeek 通过正式 Executor 决策，并真实搜索 arXiv:1706.03762 与 arX
 
 Thinking 上限提高到 100 并修复 Replan 恢复搜索额度后，最新全量联网结果为
 207 项通过、0 跳过。
+
+### 11.6 V3.1 分层评测信息流
+
+Debug 运行健康分沿用已有只读事件边界：
+
+```text
+Runtime ──deep-copied AgentEvent──> TerminalUI
+                                      ├─ 原有实时渲染
+                                      └─ ExecutionEvaluationTracker
+                                           只累计次数、状态和耗时
+                                                    ↓
+                                      turn 结束后输出四维 scorecard
+```
+
+Tracker 不保留 Tool 参数、论文摘要、chunk、回答或 reasoning，也不进入 State 和
+Checkpoint。它只能描述“这一轮是否健康执行”，不能访问 gold answer，因此不能
+判断答案正确性。
+
+外部 benchmark 是另一条离线路径：
+
+```text
+LitSearch 官方 retriever result (.json/.jsonl)
+  query + specificity + gold corpusids + ranked retrieved
+                              ↓
+                   evals/litsearch.py 校验/归一化
+                              ↓
+           broad R@20 + specific R@5/R@20 + JSON 明细
+```
+
+这条路径不加载 Agent State，也不调用 Provider。LitSearch paragraph 检索把结果写成
+`(corpusid, paragraph_idx)` 时，兼容层提取每个排序项的 corpus ID；Recall 对前 K 个
+原始排序项取集合交集，因此重复段落不会被错误计为多个 gold，也不会把 K 以后的
+论文提前。只有相同固定 corpus 和 ID 空间的结果才具有论文基线可比性。
+
+V3.1 加入评分器后的 2026-09-13 完整联网验收为 219 项通过、0 跳过。

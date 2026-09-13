@@ -7,6 +7,10 @@ from collections.abc import Callable
 from typing import Any, TextIO
 
 from events import AgentEvent
+from evals.execution import (
+    ExecutionEvaluationTracker,
+    format_execution_evaluation,
+)
 
 
 EXIT_COMMANDS = {"exit", "quit", "退出"}
@@ -37,6 +41,7 @@ class TerminalUI:
         self._input_func = input_func
         self._status = None
         self._failure_reported = False
+        self._execution_evaluation = None
         self.interactive = input_func is not None or sys.stdin.isatty()
         self.enhanced = (
             not plain
@@ -100,8 +105,13 @@ class TerminalUI:
 
     def begin_turn(self) -> None:
         self._failure_reported = False
+        self._execution_evaluation = (
+            ExecutionEvaluationTracker() if self.debug else None
+        )
 
     def handle_event(self, event: AgentEvent) -> None:
+        if self._execution_evaluation is not None:
+            self._execution_evaluation.observe(event)
         kind = event["kind"]
         if kind == "llm_started":
             self._handle_llm_started(event)
@@ -448,6 +458,14 @@ class TerminalUI:
     def report_unhandled_error(self, error: object) -> None:
         if not self._failure_reported:
             self.print_error(error)
+
+    def print_execution_evaluation(self) -> None:
+        """Print the Debug scorecard once, after one Runtime turn."""
+        tracker = self._execution_evaluation
+        self._execution_evaluation = None
+        if not self.debug or tracker is None or not tracker.has_events:
+            return
+        self._write(format_execution_evaluation(tracker.evaluate()))
 
     def confirm_save(self, paper: dict) -> bool:
         self._stop_status()

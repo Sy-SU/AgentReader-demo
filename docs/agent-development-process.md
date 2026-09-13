@@ -713,10 +713,33 @@ V3 真实使用结果选择一个明确问题，再评估 Context 压缩、检�
 - **下一小步**：提交 V3 工作后进行一次版本复盘；只有从真实使用或评测中识别出
   明确瓶颈，再与用户共同定义下一版本需求。
 
+### 7.6 V3.1：分层评测机制
+
+- **观察到的问题**：现有单元测试能发现契约回归，规划评测能检查固定状态机，真实
+  系统测试能验收一个任务，但普通 Debug 运行没有即时汇总；同时项目自己的 10 问
+  chunk 评测不能代表真实文献搜索质量。
+- **关键决策**：不使用另一个 LLM 给任意回答主观打总分。Debug 增加确定性的运行
+  健康分，只回答“是否健康执行”；答案正确性必须使用带 gold 的独立数据集。
+- **健康分信息流**：Terminal 每轮创建只读 tracker，Runtime Event 到达时只累计
+  状态、计数和耗时；回答或错误输出后渲染四维 scorecard，随后立即丢弃 tracker。
+- **Benchmark 选择**：采用 LitSearch，因为它直接面向科学文献搜索，提供 597 个
+  真实 ML/NLP 查询、固定 corpus 和 gold Semantic Scholar corpus IDs，并用
+  Recall@K 评价。ScholarQABench、LitQA2 更偏长答案综合或论文内问答，超出当前
+  搜索组件的能力边界。
+- **兼容策略**：不把 LitSearch 的深度模型、PyTorch 或完整数据复制进当前 Conda
+  环境；只实现无额外依赖的官方结果 scorer，读取其 `evaluate_index.py` 产生的
+  JSON/JSONL，并按 broad R@20、specific R@5/R@20 报告。
+- **可比性限制**：当前 AgentReader 用 arXiv/Crossref 在线 API、Top-3 和 arXiv
+  ID/DOI，LitSearch 使用固定 64,183 篇 corpus 和 S2 corpus ID。两者不能直接比较；
+  后续同 corpus 适配器可以复用 scorer，但不能用标题模糊匹配伪造官方结果。
+- **验证**：新增运行评分纯函数、错误/取消/预算路径、官方 document/paragraph
+  结果形状、JSON/JSONL、CLI 和 Debug 显示测试。
+
 ## 8. 更新记录
 
 | 日期 | 阶段 | 更新内容 | 证据 |
 |---|---|---|---|
+| 2026-09-13 | V3.1 分层评测 | Debug 四维运行健康分；LitSearch 官方结果兼容 scorer；明确健康度与正确率边界 | 真实 arXiv + DeepSeek 完整 219 项通过、0 跳过；含评分、格式/指标、CLI 和 Debug 集成测试 |
 | 2026-09-13 | V3 Thinking/恢复搜索修正 | Thinking 单轮与任务级 LLM 上限提高到 100；Replan 开启新的有界搜索阶段 | 新增高预算与 Replan 后两次恢复搜索回归；真实 arXiv + DeepSeek 全量 207 项通过、0 跳过 |
 | 2026-09-13 | V3 交互复盘修正 | current/next step 显示一致；新增 `--thinking`，单轮 30、任务级仍为 32；系统测试按协议有限恢复 blocked | 新增 3 项终端测试；真实 arXiv + DeepSeek 全量 205 项通过、无跳过 |
 | 2026-09-13 | V3 完成 | `/plan`、`/cancel`；计划生命周期事件；确定性 Planning 评测；真实双论文 PDF 验收 | 规划快照 completed=true、Replan=0、LLM=6、Tool=2、Checkpoint 最大 4,572 B；真实 arXiv + DeepSeek 全量 202 项通过、无跳过 |

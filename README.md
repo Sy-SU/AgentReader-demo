@@ -35,6 +35,8 @@ LLM 决策 -> Runtime 执行 Tool -> Tool Result 写回 State -> LLM 再决策
   周期事件、确定性规划评测和真实多论文系统验收。
 - DeepSeek thinking Tool Calling 已支持多步回传：模型返回的 reasoning 元数据只在
   State 中作为不透明协议字段保存并回传，不会显示在普通终端或 Debug Trace 中。
+- Debug 模式已增加确定性的单轮“运行健康分”，并新增兼容官方 LitSearch
+  JSON/JSONL 输出的科学文献检索 benchmark 评测器。
 
 V3 的单一目标是“可恢复的单 Agent 计划执行器”：为多论文、多步骤任务增加显式
 Planning、有限 Replanning 和本地 Checkpoint 恢复。当前 `planning.py` 已提供最多
@@ -200,7 +202,10 @@ python main.py --debug
 ```
 
 Debug 模式现在按实际发生顺序显示 LLM 和 Tool 事件、耗时、参数及有界结果，不再等
-整轮结束后一次性打印。需要用于管道、CI 或不支持增强终端的环境时：
+整轮结束后一次性打印。每次回答后还会显示 0–100 的“运行健康分”，分别检查本轮
+受控结束、事件协议完整性、Tool 成功率和预算健康度。这个分数不读取 reasoning，
+也不判断论文或答案是否正确；真正的检索质量必须使用下面的 LitSearch 等有 gold
+answer 的评测。需要用于管道、CI 或不支持增强终端的环境时：
 
 ```bash
 python main.py --plain
@@ -243,6 +248,21 @@ python evaluate_planning.py --json
 Checkpoint 保存，最大 Checkpoint 为 4,572 B。评测通过正式 Runtime 执行，只有
 Provider 响应和文献 Tool 数据被固定，因此适合发现状态机或持久化回归。
 
+对 LitSearch 官方检索结果进行评分：
+
+```bash
+python evaluate_litsearch.py \
+  path/to/LitSearch.title_abstract.bm25.jsonl
+python evaluate_litsearch.py \
+  path/to/LitSearch.title_abstract.bm25.jsonl --json
+```
+
+输入文件沿用 LitSearch 官方 `evaluate_index.py` 的结果格式：每条记录需要包含
+`query`、`query_set`、`specificity`、`quality`、gold `corpusids` 和按相关性排列的
+`retrieved` Semantic Scholar corpus IDs。评测器报告论文协议中的 broad
+Recall@20、specific Recall@5 和 specific Recall@20，不调用 LLM、网络，也不下载
+完整语料。
+
 显式运行真实搜索测试（会先请求 arXiv，失败或无结果时请求 Crossref）：
 
 ```bash
@@ -272,8 +292,8 @@ RUN_LIVE_ARXIV_TESTS=1 RUN_LIVE_LLM_TESTS=1 \
 同时设置两个开关后还会执行真实多论文系统用例：固定高层计划后，由 DeepSeek 通过
 正式 Executor 分别搜索 arXiv:1706.03762 与 arXiv:1810.04805、下载两份真实 PDF、
 检索两边的页码证据并生成比较。固定计划用于降低模型规划措辞的偶然性；Executor、
-Provider、网络、PDF 索引和证据校验均为真实生产路径。2026-09-13 的完整验收为
-207 项测试全部通过、0 跳过。
+Provider、网络、PDF 索引和证据校验均为真实生产路径。加入 V3.1 评测机制后的
+2026-09-13 完整验收为 219 项测试全部通过、0 跳过。
 
 环境变量开关仍然保留，使普通离线开发或没有 API Key 的 CI 不会意外访问网络和
 产生模型费用；Codex 后续进行完整验收时使用上面的联网命令。
@@ -492,6 +512,31 @@ python evaluate_retrieval.py --compare
 python evaluate_retrieval.py --compare --json
 python evaluate_retrieval.py --method bm25
 ```
+
+## Agent 运行评测与外部 Benchmark
+
+评测分成两个不能混用的层级：
+
+1. `python main.py --debug` 的运行健康分只使用 Runtime Event。权重为本轮控制
+   45%、事件协议完整性 25%、Tool 成功率 20%、预算健康度 10%；没有 Tool 的普通
+   回答会把 Tool 维度标成 `N/A` 并按其余适用维度重新归一。用户取消不评分，
+   `run_failed`、未配对事件、Tool error 和达到上限都会显式降低对应维度。
+2. `evaluate_litsearch.py` 衡量带 gold corpus ID 的科学文献召回率。项目选择
+   [LitSearch](https://github.com/princeton-nlp/LitSearch)，因为它专门评估真实的
+   ML/NLP 文献搜索问题，并使用可确定计算的 Recall@K，而不是让另一个 LLM 主观
+   打分。
+
+两层分开是必要的：一次控制流完整、得分 100 的运行仍可能找错论文；反过来，网络
+错误也不应被包装成答案正确率。LitSearch 的完整基准使用其固定 64,183 篇 corpus
+和 Semantic Scholar corpus ID，而 AgentReader 当前实时搜索 arXiv/Crossref、最多
+向模型暴露 3 个候选，标识也以 arXiv ID/DOI 为主。因此只有使用同一 LitSearch
+corpus 产生的 `retrieved` IDs 才能与论文基线直接比较；不能把交互终端的标题列表
+硬凑成官方分数。
+
+本项目只实现轻量、无额外依赖的兼容 scorer。要复现实验，先按
+[LitSearch 官方 README](https://github.com/princeton-nlp/LitSearch#evaluation)
+在独立环境生成结果文件，再交给 `evaluate_litsearch.py`；机器可读 JSON 可直接
+进入 CI 或后续回归对比。
 
 ## 检索资源测量
 

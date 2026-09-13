@@ -441,6 +441,33 @@ Replan=0、LLM 决策 6 次、Tool 执行 2 次、Checkpoint 保存 13 次、最
 提交后的交互复盘又增加 `--thinking` 和 current/next step 显示回归测试；最新一次
 完整联网验收运行 207 项测试，207 项全部通过，没有跳过。
 
+### FR-20：V3.1 分层评测（已实现）
+
+- Debug 模式必须在每次 Runtime turn 结束后输出确定性的运行健康分；普通模式不
+  增加这段输出。
+- 健康分只能使用结构化 Runtime Event，不读取 reasoning，不再次调用模型，也不把
+  用户查询、摘要、chunk 或完整 Tool Result 持久化到评分器。
+- 评分必须分别暴露本轮控制、事件协议完整性、Tool 成功率和预算健康度；Tool 未被
+  调用时对应维度为 `N/A`，用户取消时不评分。
+- 输出必须明确声明健康分不等于答案正确率。一个控制流完整的错误答案不能得到
+  “检索正确”的结论。
+- 外部文献搜索质量采用 LitSearch 的官方记录格式和宏平均 Recall@K 定义；至少报告
+  broad Recall@20、specific Recall@5 和 specific Recall@20。
+- LitSearch scorer 必须读取 `.json`/`.jsonl`，支持官方文档级 corpus ID 以及段落
+  结果中的 `(corpusid, paragraph_idx)` 形状，并提供 `--json` 机器可读报告。
+- scorer 默认离线，不下载完整 LitSearch corpus、不调用 Agent、LLM 或网络；输入
+  不完整、ID 非法或重复 gold ID 时必须失败，而不是产生貌似有效的分数。
+- 只有在相同 LitSearch corpus 上生成、并已映射为 Semantic Scholar corpus ID 的
+  `retrieved` 列表才能与论文结果直接比较。AgentReader 在线 arXiv/Crossref Top-3
+  结果不得自动冒充官方 benchmark 输出。
+
+运行健康分权重固定为：本轮控制 45、协议完整性 25、Tool 成功率 20、预算健康度
+10。没有 Tool 时只对其余适用维度重新归一；达到 `max_steps`、Runtime guard、
+Tool error 或 `run_failed` 只降低其对应的可解释维度。
+
+2026-09-13 完整联网验收在项目 Conda 环境运行 219 项测试，真实 arXiv、DeepSeek
+thinking 和双 PDF 系统用例全部执行，219 项全部通过、0 跳过。
+
 ## 4. 状态需求
 
 V1 State 只保存当前任务需要的信息：

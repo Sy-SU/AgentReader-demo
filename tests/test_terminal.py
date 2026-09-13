@@ -171,6 +171,72 @@ class TerminalUITests(unittest.TestCase):
         self.assertNotIn("A" * 401, rendered)
         self.assertNotIn("\x1b[", rendered)
 
+    def test_debug_cli_prints_execution_health_after_answer(self):
+        inputs = iter(["请搜索论文", "/exit"])
+        output = StringIO()
+        terminal = TerminalUI(
+            debug=True,
+            plain=True,
+            input_func=lambda prompt: next(inputs),
+            output=output,
+        )
+
+        def fake_run_agent(
+            state,
+            confirm_save=None,
+            on_event=None,
+            checkpoint_file=None,
+        ):
+            on_event({"kind": "llm_started", "turn_step": 1})
+            on_event(
+                {
+                    "kind": "llm_finished",
+                    "turn_step": 1,
+                    "response_type": "final",
+                    "duration_ms": 10,
+                }
+            )
+            on_event(
+                {
+                    "kind": "turn_finished",
+                    "turn_step": 1,
+                    "status": "completed",
+                }
+            )
+            return "搜索完成。"
+
+        with patch("main.run_agent", side_effect=fake_run_agent):
+            run_cli(ui=terminal)
+
+        rendered = output.getvalue()
+        self.assertLess(rendered.index("搜索完成。"), rendered.index("运行健康分"))
+        self.assertIn("运行健康分 100/100", rendered)
+        self.assertIn("Tool N/A", rendered)
+        self.assertIn("不代表答案正确率", rendered)
+
+    def test_normal_cli_does_not_print_execution_health(self):
+        inputs = iter(["普通任务", "/exit"])
+        output = StringIO()
+        terminal = TerminalUI(
+            plain=True,
+            input_func=lambda prompt: next(inputs),
+            output=output,
+        )
+
+        def fake_run_agent(
+            state,
+            confirm_save=None,
+            on_event=None,
+            checkpoint_file=None,
+        ):
+            on_event({"kind": "turn_finished", "status": "completed"})
+            return "完成。"
+
+        with patch("main.run_agent", side_effect=fake_run_agent):
+            run_cli(ui=terminal)
+
+        self.assertNotIn("运行健康分", output.getvalue())
+
     def test_terminal_renders_bounded_plan_and_checkpoint_events(self):
         output = StringIO()
         terminal = TerminalUI(debug=True, plain=True, output=output)
