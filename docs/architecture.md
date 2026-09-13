@@ -182,6 +182,14 @@ Tool 包通过 `tools/__init__.py` 暴露稳定公共接口，调用方继续使
   控制、协议、Tool 和预算四维运行健康分；`terminal.py` 只负责渲染该报告。
 - `evals/litsearch.py` 读取 LitSearch 官方 retrieval result 记录并复用其 corpus ID
   Recall@K 定义；`evaluate_litsearch.py` 输出官方 broad/specific cutoff 或 JSON。
+- `evals/litsearch_baseline.py` 读取投影后的固定 title/abstract corpus，在内存
+  SQLite FTS5 中生成同 ID 空间的 Top-20 结果；`run_litsearch_baseline.py` 组合
+  检索、评分和可选原子结果写出。该模块不进入 Tool Registry。
+- `evals/agent_task_cases.json` 保存版本化 gold task contract、受控 Provider 动作
+  和外部 Tool fixture；`evals/agent_tasks.py` 用正式 Runtime 执行并提供 case 过滤、
+  人类报告、JSON 和有界 Debug 输出。
+- `evals/task_success.py` 只从最终 State 提取完成状态、Tool 计数、论文 ID 和有效
+  证据页码；`evaluate_agent_tasks.py` 是对应命令行入口。
 - 检索质量评测不进入 Runtime 或 Agent Loop；Planning 评测则刻意经过正式 Runtime，
   但不调用真实 LLM 或网络。运行健康评分观察正式 Runtime Event，但不反向控制
   Runtime。资源基准只使用自己在临时目录创建的缓存。
@@ -352,6 +360,10 @@ Crossref 回退结果还包含 `fallback_reason`，用于区分 arXiv 无结果�
 不可用时还包含 `arxiv_error`，用于在 Debug Trace 中保留 HTTP 429、超时等具体
 原因。query 包含标准数字 arXiv ID 时，搜索层使用 `id_list` 定向查询；HTTP 429
 会按 `Retry-After` 或默认 3 秒等待并重试一次。
+若明确 ID 的 export API 请求仍不可用，搜索层读取最大 2 MiB 的官方
+`arxiv.org/abs/<id>` 页面，只接受 ID 一致且包含标题和官方 PDF URL 的 citation
+metadata；该路径仍失败后才进入 Crossref。普通关键词请求不会根据任意搜索文本
+构造 arXiv 候选。
 `candidate_id` 优先使用去除版本号的 arXiv ID，其次使用 DOI；两者都没有时
 使用标题和论文 URL 的稳定哈希。
 
@@ -1125,3 +1137,87 @@ LitSearch 官方 retriever result (.json/.jsonl)
 论文提前。只有相同固定 corpus 和 ID 空间的结果才具有论文基线可比性。
 
 V3.1 加入评分器后的 2026-09-13 完整联网验收为 219 项通过、0 跳过。
+
+### 11.7 V3.2 同语料检索适配（Step 1 已实现）
+
+V3.1 只能给已有 `retrieved` 结果评分；V3.2 第一小步补上结果生成路径：
+
+```text
+投影后的 corpus.jsonl
+  corpusid + title + abstract
+              ↓ 严格校验唯一 ID、文本和大小边界
+     SQLite FTS5 + Porter 临时内存索引
+              ↑
+官方 queries.jsonl → 共享 query 契约 → 每条检索 Top-20..200
+                                      ↓
+             Semantic Scholar corpus IDs
+                       ├─ 直接进入 evals/litsearch.py
+                       └─ 可选原子写出官方形状 JSON/JSONL
+```
+
+SQLite 使用 `bm25()` 排序，相同分数按索引 rowid 保持确定性；匹配项不足 K 时按
+输入 corpus 顺序补齐未出现 ID，使输出深度真实达到语料允许的上限。查询词经过
+有界 Unicode token 提取后使用 OR 组合，最多 128 个不同词。索引、查询和结果都
+不进入 Runtime、State、Checkpoint 或生产 Tool。
+
+这个方法名固定为 `agentreader_sqlite_fts5_porter_v1`。官方 LitSearch BM25 使用
+NLTK tokenize/stopwords/Porter stemmer 与 `rank_bm25.BM25Okapi`，因此两者算法不
+同，报告中的 `official_baseline_compatible=false` 是必要边界。相同 corpus ID
+使 gold Recall 可计算，但只有下一步准备官方固定语料并完整实跑后，才能记录项目
+自己的全量 baseline；仍不能把它称为论文官方 BM25 复现。
+
+Step 1 的 2026-09-13 完整联网验收为 226 项通过、0 跳过，覆盖真实 arXiv、
+DeepSeek、Thinking 和双 PDF 系统路径。
+
+### 11.8 V3.2 官方数据准备与固定基线（Step 2 已实现）
+
+```text
+独立 agent-reader-benchmark Conda 环境
+          ↓ 固定 dataset revision
+Hugging Face: query + corpus_clean（1 + 6 Parquet）
+          ↓ PyArrow batch 流式列投影
+queries.jsonl       corpus.jsonl
+597 条              64,183 篇，仅 ID/title/abstract
+          ↓ 严格 loader、条数和 SHA-256 校验
+20-query smoke → 597-query full → V3.1 scorer 独立复算
+```
+
+数据下载环境只包含 Python 3.10、`huggingface_hub` 和 PyArrow；主 Agent 环境不新增
+依赖。数据集固定 revision `9573fb284a1026c998df47024b888a163f0f0e25`，源文件总计
+1,257,134,725 B，投影 corpus 为 61,936,346 B。官方 title/abstract 同时为空的
+记录仍保留，以保证 corpus ID 空间不变；它不会产生 FTS 词法命中。
+
+首次全量基线的索引耗时 805.2 ms、597-query 检索耗时 31,119.4 ms；Broad
+R@20=0.424，Specific R@5=0.523，Specific R@20=0.692，全体 R@5=0.465、
+R@20=0.623。结果由保存的官方形状 JSONL 再次交给 scorer 独立复算一致。完整联网
+回归为 231 项通过、0 跳过。
+
+### 11.9 V3.2 Agent 任务成功率边界（已实现）
+
+普通交互请求没有 gold，因此生产 Debug 仍只计算 Runtime Event 健康度。任务正确性
+进入独立、有 gold 的评测路径：
+
+```text
+agent_task_cases.json
+  goal + fixed decisions + Tool fixtures + expectations
+                         ↓
+                  production Runtime
+                         ↓
+             final State（不改变其 schema）
+                         ↓
+        evals/task_success.py 结构化观察
+          ├─ plan/final completion
+          ├─ successful Tool counts
+          ├─ candidate IDs discovered
+          ├─ paper IDs downloaded
+          ├─ page-numbered evidence IDs
+          └─ no-result safe stop
+```
+
+scorer 不接收 Runtime 控制权，也不解析 final answer 语义；输出只包含 ID、Tool 名、
+计数、页码和布尔检查。确定性 runner 固定 Provider/外部 Tool 数据，但复用正式
+Runtime、参数可信恢复、Plan、evidence reference 和 Checkpoint 生命周期。
+
+固定三个 case 的结果为 3/3、平均 100 分。真实双论文系统用例复用同一 scorer，
+但仍保留对真实 arXiv 来源、双 PDF 下载、双边页码证据和最终回答的独立断言。
+2026-09-13 完整联网回归 247 项通过、0 跳过。

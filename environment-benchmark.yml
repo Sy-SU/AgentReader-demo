@@ -1,0 +1,9 @@
+name: agent-reader-benchmark
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - huggingface-hub==0.24.0
+      - pyarrow==16.1.0

@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from evals.task_success import evaluate_task_success
 from planner import SUBMIT_PLAN_SCHEMA
 from runtime import run_agent
 from state import append_user_message, create_state
@@ -61,6 +62,37 @@ LIVE_MULTI_PAPER_PLAN = {
             "paper in the final answer."
         ),
     ],
+}
+
+LIVE_MULTI_PAPER_TASK_CONTRACT = {
+    "id": "live-two-paper-evidence-comparison",
+    "expectations": {
+        "terminal_status": "completed",
+        "required_tools": {
+            "search_paper": 2,
+            "download_paper": 2,
+            "retrieve_paper_chunks": 2,
+        },
+        "allowed_tools": [
+            "search_paper",
+            "download_paper",
+            "retrieve_paper_chunks",
+            "extract_paper_text",
+        ],
+        "candidate_ids": [
+            "arxiv:1706.03762",
+            "arxiv:1810.04805",
+        ],
+        "download_ids": [
+            "arxiv:1706.03762",
+            "arxiv:1810.04805",
+        ],
+        "evidence_ids": [
+            "arxiv:1706.03762",
+            "arxiv:1810.04805",
+        ],
+        "expect_no_results": False,
+    },
 }
 
 
@@ -209,6 +241,12 @@ class LiveMultiPaperSystemTests(unittest.TestCase):
             self.assertEqual(state["plan"]["status"], "completed")
             self.assertFalse(checkpoint_file.exists())
             self._assert_real_tool_evidence(state)
+            task_success = evaluate_task_success(
+                LIVE_MULTI_PAPER_TASK_CONTRACT,
+                state,
+            )
+            self.assertTrue(task_success["passed"], task_success)
+            self.assertEqual(task_success["score"], 100.0)
             self.assertIn("Attention Is All You Need", final_answer)
             self.assertIn("BERT", final_answer)
             page_citations = re.findall(

@@ -735,10 +735,79 @@ V3 真实使用结果选择一个明确问题，再评估 Context 压缩、检�
 - **验证**：新增运行评分纯函数、错误/取消/预算路径、官方 document/paragraph
   结果形状、JSON/JSONL、CLI 和 Debug 显示测试。
 
+### 7.7 V3.2：从 scorer 到同语料结果生成
+
+- **观察到的问题**：V3.1 能可靠计算 Recall，但仍要求外部提供 `retrieved`；项目
+  自己还没有进入 LitSearch 的固定 corpus ID 空间，因此不能形成可复现基线。
+- **最小切分**：先只完成 title/abstract 检索器，不同时接 LLM、Agent Loop 或
+  full-paper retrieval。这样失败能明确归因于数据加载、排序或 Agent 决策中的一层。
+- **依赖决策**：官方 BM25 使用 NLTK 与 `rank_bm25`。主环境暂不复制这套依赖，
+  而用 Python 自带 SQLite FTS5 + Porter 建立轻量 baseline；方法名和报告显式标记
+  不具备官方数值可比性。
+- **信息流**：投影 corpus 与原始 queries 分别校验；内存索引为每条 query 生成
+  Top-20 corpus IDs；结果直接复用 V3.1 scorer，也可原子写成官方 JSON/JSONL。
+- **安全与数据边界**：最多 100,000 篇、1,000 queries、Top-200；拒绝超过
+  512 MiB 的非投影输入。`data/evals/` 被忽略，production Tool 和用户数据不变。
+- **验证**：合成同 ID 语料覆盖正确排序、query limit、输入形状、重复 ID、
+  Recall@20 最低深度、CLI JSON 和原子结果写出；完整离线 226 项通过、5 项联网
+  测试按开关跳过；完整联网 226 项通过、0 跳过，包含真实 arXiv、DeepSeek、
+  Thinking 和双 PDF 系统路径。官方数据准备与全量指标见下面的 Step 2。
+
+### 7.8 V3.2：官方数据与首次可复现基线
+
+- **环境隔离**：新建 `environment-benchmark.yml`，只为数据下载与 Parquet 投影安装
+  Python 3.10、Hugging Face Hub 和 PyArrow；主 Agent 环境不增加依赖。
+- **避免无效数据膨胀**：没有用 `datasets` 展开全部五列，而是下载固定 revision 的
+  1 个 query、6 个 `corpus_clean` Parquet 分片，批量读取必要列。1.257 GB 源数据
+  最终形成约 61.9 MB 的 title/abstract corpus JSONL。
+- **由真实数据修正规则**：第 4,966 条官方记录没有 title/abstract。为了保持固定
+  corpus ID 空间，空文本记录必须保留，而不能作为脏数据删除；新增回归测试锁定。
+- **失败恢复**：第一次投影因嵌套 `corpusids` 的 schema 检查失败；改用顶层 Arrow
+  schema 后复用下载缓存。半成品检测、`--force` 原子替换和 SHA-256 元数据均按
+  设计生效。
+- **基线结果**：20-query smoke 通过后完成 597-query 全集；Broad R@20=0.424，
+  Specific R@5=0.523、R@20=0.692，全体 R@5=0.465、R@20=0.623。索引约
+  0.805 秒、检索约 31.119 秒，独立 scorer 复算一致。
+- **回归证据**：18 项 LitSearch 聚焦测试通过；完整离线 231 项通过、5 项联网按
+  开关跳过；完整联网 231 项通过、0 跳过。
+
+### 7.9 V3.2：Agent 层结构化任务成功率（已完成）
+
+- **目标**：在已有运行健康分和 LitSearch 检索分之外，增加带 gold case 的 Agent
+  任务结果评分，回答“Runtime、模型动作和 Tool 结果组合后是否完成了指定任务”。
+- **非目标**：不让另一个 LLM 主观打分；不从任意自由文本中匹配论文标题或推断
+  引用正确性；不把离线 fixture 分数冒充真实模型能力；不修改 production Tool、
+  Runtime 权限边界或用户 State 格式。
+- **信息流**：版本化 case 定义目标、受控 Provider 动作、Tool fixture 和结构化
+  期望；runner 经正式 Runtime 执行；scorer 只读取最终 Plan 状态及可信 Tool Result，
+  分别检查任务完成、Tool 使用、gold 候选发现、明确下载选择、页码证据和无结果时
+  安全停止。
+- **阶段拆分**：先实现纯 scorer/严格 case 契约；再实现三类正式 Runtime 场景与
+  CLI；最后增加 `--debug` 分项诊断、接入真实双论文验收并完成全量回归。
+- **实现结果**：新增三个版本化 case，覆盖精确标题搜索、正常无结果和双论文计划
+  执行；固定 Provider 决策与外部 Tool 数据，但由正式 Runtime 完成 Tool 参数恢复、
+  Plan 推进、evidence 和 Checkpoint 生命周期。CLI 支持按 case 过滤、JSON 和有界
+  Debug 报告。
+- **真实验收接入**：DeepSeek 双论文系统测试在保留真实 arXiv、双 PDF、双边页码
+  证据及最终回答断言的同时，增加结构化 task contract 100 分断言。
+- **验收中发现并修复的 Bug**：export.arxiv.org 连续超时会让明确 arXiv ID 也回退
+  到无 PDF 的 Crossref 记录，使任务无法继续。现在仍优先 export API；仅在请求含
+  明确 ID 且 API 不可用时，读取有界的官方摘要页 citation metadata，并严格校验
+  ID、标题和官方 PDF URL。普通关键词和不可信页面不能走该捷径。
+- **最终证据**：固定 task suite 3/3、平均 100 分；完整离线共 247 项、5 项联网按
+  开关跳过；启用真实 arXiv 与 DeepSeek 后 247 项全部通过、0 跳过，真实双论文
+  task contract 为 100 分。
+- **验收标准**：固定成功案例应为 100；缺论文、错下载、无页码证据、Tool error、
+  未完成任务和无结果后继续副作用必须分别扣分；报告不得保留摘要、chunk 正文、
+  reasoning、API Key 或本地 PDF 路径。
+
 ## 8. 更新记录
 
 | 日期 | 阶段 | 更新内容 | 证据 |
 |---|---|---|---|
+| 2026-09-13 | V3.2 Step 3 | 正式 Runtime 结构化 task scorer、3 类 gold case、CLI/Debug、真实系统接入；明确 arXiv ID 的官方摘要页兜底 | 固定 task suite 3/3、平均 100；完整离线 247 项、5 项按开关跳过；完整联网 247 项通过、0 跳过 |
+| 2026-09-13 | V3.2 Step 2 | 独立 benchmark 环境；固定 revision 下载和流式投影；官方 597-query 首次基线 | Broad R@20=0.424；Specific R@5=0.523、R@20=0.692；全体 R@20=0.623；完整联网 231 项通过、0 跳过 |
+| 2026-09-13 | V3.2 Step 1 | SQLite FTS5 同 LitSearch corpus ID 检索；Top-20；复用 scorer；官方形状写出 | 13 项 LitSearch 聚焦测试通过；完整离线 226 项通过、5 项联网按开关跳过；完整联网 226 项通过、0 跳过；官方 64k corpus 尚未实跑 |
 | 2026-09-13 | V3.1 分层评测 | Debug 四维运行健康分；LitSearch 官方结果兼容 scorer；明确健康度与正确率边界 | 真实 arXiv + DeepSeek 完整 219 项通过、0 跳过；含评分、格式/指标、CLI 和 Debug 集成测试 |
 | 2026-09-13 | V3 Thinking/恢复搜索修正 | Thinking 单轮与任务级 LLM 上限提高到 100；Replan 开启新的有界搜索阶段 | 新增高预算与 Replan 后两次恢复搜索回归；真实 arXiv + DeepSeek 全量 207 项通过、0 跳过 |
 | 2026-09-13 | V3 交互复盘修正 | current/next step 显示一致；新增 `--thinking`，单轮 30、任务级仍为 32；系统测试按协议有限恢复 blocked | 新增 3 项终端测试；真实 arXiv + DeepSeek 全量 205 项通过、无跳过 |

@@ -18,8 +18,11 @@ from runtime import DEFAULT_MAX_STEPS_PER_TURN, execute_tool, run_agent
 from state import append_user_message, create_state
 from tools import list_library, save_paper, search_paper
 from tools.search import (
+    MAX_ARXIV_ABS_BYTES,
+    _fetch_arxiv_abs_page,
     _fetch_arxiv_feed,
     _fetch_crossref_data,
+    _parse_arxiv_abs_page,
     _search_result,
 )
 
@@ -52,6 +55,17 @@ ARXIV_RESULT = b"""\
 EMPTY_ARXIV_RESULT = b"""\
 <?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" />
+"""
+
+ARXIV_ABS_PAGE = b"""\
+<html><head>
+<meta name="citation_title" content="Attention Is All You Need">
+<meta name="citation_author" content="Vaswani, Ashish">
+<meta name="citation_date" content="2017/06/12">
+<meta name="citation_pdf_url" content="https://arxiv.org/pdf/1706.03762">
+<meta name="citation_arxiv_id" content="1706.03762">
+<meta name="citation_abstract" content="Transformer abstract.">
+</head></html>
 """
 
 CROSSREF_RESULT = b"""\
@@ -221,6 +235,59 @@ class AgentV1Tests(unittest.TestCase):
         self.assertEqual(first_paper["source"], "arxiv")
         fetch_feed.assert_called_once_with("Attention Is All You Need")
         fetch_crossref.assert_not_called()
+
+    def test_explicit_arxiv_id_uses_official_html_when_export_is_unavailable(
+        self,
+    ):
+        with (
+            patch(
+                "tools.search._fetch_arxiv_feed",
+                side_effect=RuntimeError("export timeout"),
+            ),
+            patch(
+                "tools.search._fetch_arxiv_abs_page",
+                return_value=ARXIV_ABS_PAGE,
+            ) as fetch_abs,
+            patch("tools.search._fetch_crossref_data") as fetch_crossref,
+        ):
+            result = search_paper(
+                "Attention Is All You Need 1706.03762"
+            )
+
+        self.assertEqual(result["source"], "arxiv")
+        self.assertEqual(result["count"], 1)
+        paper = result["papers"][0]
+        self.assertEqual(paper["candidate_id"], "arxiv:1706.03762")
+        self.assertEqual(paper["published"], "2017-06-12")
+        self.assertEqual(
+            paper["pdf_url"], "https://arxiv.org/pdf/1706.03762"
+        )
+        fetch_abs.assert_called_once_with("1706.03762")
+        fetch_crossref.assert_not_called()
+
+    def test_arxiv_html_fallback_rejects_mismatched_metadata(self):
+        mismatched = ARXIV_ABS_PAGE.replace(
+            b'content="1706.03762"',
+            b'content="1810.04805"',
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "mismatched"):
+            _parse_arxiv_abs_page(
+                mismatched,
+                "1706.03762",
+                query="Attention Is All You Need 1706.03762",
+            )
+
+    @patch("tools.search.urlopen")
+    def test_arxiv_html_fallback_rejects_declared_oversize(self, urlopen):
+        response = urlopen.return_value.__enter__.return_value
+        response.headers = {
+            "Content-Length": str(MAX_ARXIV_ABS_BYTES + 1)
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "too large"):
+            _fetch_arxiv_abs_page("1706.03762")
+        response.read.assert_not_called()
 
     @patch("tools.search.urlopen")
     def test_arxiv_id_query_uses_direct_id_list(self, urlopen):

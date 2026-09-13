@@ -37,6 +37,12 @@ LLM 决策 -> Runtime 执行 Tool -> Tool Result 写回 State -> LLM 再决策
   State 中作为不透明协议字段保存并回传，不会显示在普通终端或 Debug Trace 中。
 - Debug 模式已增加确定性的单轮“运行健康分”，并新增兼容官方 LitSearch
   JSON/JSONL 输出的科学文献检索 benchmark 评测器。
+- V3.2 已完成同语料适配和首次官方数据实跑：可用 SQLite FTS5 在 LitSearch
+  title/abstract 固定语料上生成 Top-20 corpus IDs，并直接进入现有 scorer；
+  597-query 全量 Recall@20 为 0.623，完整联网回归 231 项全部通过、0 跳过。
+- V3.2 已增加经过正式 Runtime 的结构化 Agent 任务成功率评测：固定三类 gold
+  case，分别检查完成状态、Tool 使用、候选、下载、页码证据和无结果安全停止；
+  完整联网回归 247 项全部通过、0 跳过。
 
 V3 的单一目标是“可恢复的单 Agent 计划执行器”：为多论文、多步骤任务增加显式
 Planning、有限 Replanning 和本地 Checkpoint 恢复。当前 `planning.py` 已提供最多
@@ -248,6 +254,18 @@ python evaluate_planning.py --json
 Checkpoint 保存，最大 Checkpoint 为 4,572 B。评测通过正式 Runtime 执行，只有
 Provider 响应和文献 Tool 数据被固定，因此适合发现状态机或持久化回归。
 
+运行固定的 Agent 任务成功率评测（不访问网络或模型）：
+
+```bash
+python evaluate_agent_tasks.py
+python evaluate_agent_tasks.py --debug
+python evaluate_agent_tasks.py --case two-paper-evidence-comparison --json
+```
+
+三个版本化 case 覆盖精确标题搜索、无结果安全停止和双论文页码证据比较。Runner
+固定 Provider 决策及外部 Tool 数据，但执行正式 Runtime；`--debug` 只显示有界的
+分项检查、Tool 计数、论文 ID 和页码，不输出摘要、证据正文、推理或本地路径。
+
 对 LitSearch 官方检索结果进行评分：
 
 ```bash
@@ -262,6 +280,21 @@ python evaluate_litsearch.py \
 `retrieved` Semantic Scholar corpus IDs。评测器报告论文协议中的 broad
 Recall@20、specific Recall@5 和 specific Recall@20，不调用 LLM、网络，也不下载
 完整语料。
+
+在相同 LitSearch corpus ID 空间运行 AgentReader 的轻量检索基线：
+
+```bash
+python run_litsearch_baseline.py \
+  data/evals/litsearch/corpus.jsonl \
+  data/evals/litsearch/queries.jsonl \
+  --limit 20 \
+  --output data/evals/litsearch/results.jsonl
+```
+
+删除 `--limit 20` 即运行全部查询。`--json` 可输出包含检索耗时和评分明细的机器
+可读报告。corpus 输入只需 `corpusid`、`title`、`abstract`；query 输入沿用官方
+`query` 配置字段。该命令至少生成 Top-20，确保 Recall@20 的候选深度成立。
+`data/evals/` 已被 Git 忽略，避免提交大体积 benchmark 数据和结果。
 
 显式运行真实搜索测试（会先请求 arXiv，失败或无结果时请求 Crossref）：
 
@@ -293,17 +326,21 @@ RUN_LIVE_ARXIV_TESTS=1 RUN_LIVE_LLM_TESTS=1 \
 正式 Executor 分别搜索 arXiv:1706.03762 与 arXiv:1810.04805、下载两份真实 PDF、
 检索两边的页码证据并生成比较。固定计划用于降低模型规划措辞的偶然性；Executor、
 Provider、网络、PDF 索引和证据校验均为真实生产路径。加入 V3.1 评测机制后的
-2026-09-13 完整验收为 219 项测试全部通过、0 跳过。
+2026-09-13 最新完整验收为 247 项测试全部通过、0 跳过，其中真实双论文系统用例
+同时通过原有内容/页码断言和结构化 task success 100 分断言。
 
 环境变量开关仍然保留，使普通离线开发或没有 API Key 的 CI 不会意外访问网络和
 产生模型费用；Codex 后续进行完整验收时使用上面的联网命令。
 
-正常运行 `python main.py` 时，`search_paper` 会优先查询 arXiv；
-只有 arXiv 超时、报错或无结果时，才会查询 Crossref。可选设置
+正常运行 `python main.py` 时，`search_paper` 会优先查询 export.arxiv.org；
+明确 arXiv ID 的 export 请求不可用时，会从有界的官方 arxiv.org 摘要页读取并校验
+同一 ID 的 citation metadata；该入口也失败或普通关键词无结果时，才查询
+Crossref。可选设置
 `CROSSREF_MAILTO`，让 Crossref 请求进入官方推荐的 polite pool。
 arXiv 返回 HTTP 429 时会等待后重试一次；如果 query 中包含 `1706.03762`
-这样的 arXiv ID，则改用 API 的 `id_list` 定向查询。这样模型在补充明确 ID 后
-能够取得权威 metadata 和 PDF URL，而不是继续依赖不含 PDF 的 Crossref 记录。
+这样的 arXiv ID，则先使用 API 的 `id_list` 定向查询。这样模型在补充明确 ID 后，
+即使 export API 暂时超时，也能从官方页面取得经过 ID 一致性校验的 metadata 和
+PDF URL，而不是继续依赖不含 PDF 的 Crossref 记录。
 重试后仍需回退时，结果中的 `arxiv_error` 会保留简短原因供 Debug Trace 查看。
 普通关键词搜索会从 arXiv 或 Crossref 取得最多 10 篇候选，再根据 query 与标题、
 摘要的词项重叠做确定性本地重排，最后仍只返回前 3 篇给模型。标题每命中一个
@@ -515,28 +552,62 @@ python evaluate_retrieval.py --method bm25
 
 ## Agent 运行评测与外部 Benchmark
 
-评测分成两个不能混用的层级：
+评测分成三个不能混用的层级：
 
 1. `python main.py --debug` 的运行健康分只使用 Runtime Event。权重为本轮控制
    45%、事件协议完整性 25%、Tool 成功率 20%、预算健康度 10%；没有 Tool 的普通
    回答会把 Tool 维度标成 `N/A` 并按其余适用维度重新归一。用户取消不评分，
    `run_failed`、未配对事件、Tool error 和达到上限都会显式降低对应维度。
-2. `evaluate_litsearch.py` 衡量带 gold corpus ID 的科学文献召回率。项目选择
+2. `evaluate_agent_tasks.py` 衡量带 gold task contract 的 Agent 任务成功率。
+   固定 case 经正式 Runtime 执行，分别检查完成、Tool、候选、下载、证据和安全
+   停止；它不解析最终回答语义，也不调用 LLM-as-a-Judge。
+3. `evaluate_litsearch.py` 衡量带 gold corpus ID 的科学文献召回率。项目选择
    [LitSearch](https://github.com/princeton-nlp/LitSearch)，因为它专门评估真实的
    ML/NLP 文献搜索问题，并使用可确定计算的 Recall@K，而不是让另一个 LLM 主观
    打分。
 
-两层分开是必要的：一次控制流完整、得分 100 的运行仍可能找错论文；反过来，网络
-错误也不应被包装成答案正确率。LitSearch 的完整基准使用其固定 64,183 篇 corpus
+三层分开是必要的：一次控制流完整、健康分 100 的运行仍可能找错论文；固定 fixture
+任务分 100 也不代表真实模型或开放世界检索质量。反过来，网络错误也不应被包装成
+答案正确率。LitSearch 的完整基准使用其固定 64,183 篇 corpus
 和 Semantic Scholar corpus ID，而 AgentReader 当前实时搜索 arXiv/Crossref、最多
 向模型暴露 3 个候选，标识也以 arXiv ID/DOI 为主。因此只有使用同一 LitSearch
 corpus 产生的 `retrieved` IDs 才能与论文基线直接比较；不能把交互终端的标题列表
 硬凑成官方分数。
 
-本项目只实现轻量、无额外依赖的兼容 scorer。要复现实验，先按
-[LitSearch 官方 README](https://github.com/princeton-nlp/LitSearch#evaluation)
-在独立环境生成结果文件，再交给 `evaluate_litsearch.py`；机器可读 JSON 可直接
-进入 CI 或后续回归对比。
+本项目的 V3.1 scorer 可以评估任意官方形状结果；V3.2 的第一步又增加了
+`agentreader_sqlite_fts5_porter_v1` 同语料 baseline。它使用 Python 自带 SQLite
+FTS5/Porter，不修改 production `search_paper`，也不调用 LLM。它和官方使用
+NLTK + `rank_bm25` 的实现并不相同，所以报告会明确显示
+`Comparable to official retriever numbers: no`；它的结果可以稳定评估当前项目的
+相对改动，但不能冒充论文中的官方 BM25 数值。
+
+官方数据使用独立环境，避免把 Hugging Face/PyArrow 加入主 Agent 环境：
+
+```bash
+conda env create -f environment-benchmark.yml
+conda run -n agent-reader-benchmark python prepare_litsearch_data.py
+
+conda run -n agent-reader-demo python run_litsearch_baseline.py \
+  data/evals/litsearch/corpus.jsonl \
+  data/evals/litsearch/queries.jsonl \
+  --limit 20 \
+  --output data/evals/litsearch/results-smoke-20.jsonl
+
+conda run -n agent-reader-demo python run_litsearch_baseline.py \
+  data/evals/litsearch/corpus.jsonl \
+  data/evals/litsearch/queries.jsonl \
+  --output data/evals/litsearch/results-full.jsonl
+```
+
+数据准备固定 revision `9573fb284a1026c998df47024b888a163f0f0e25`，下载 1 个
+query 和 6 个 `corpus_clean` Parquet 分片，只投影 `corpusid/title/abstract`。
+缓存、投影、校验和元数据及结果都位于被 Git 忽略的 `data/evals/`。
+
+2026-09-13 首次全量运行覆盖 64,183 篇论文和 597 条 query：Broad Recall@20
+为 0.424，Specific Recall@5 为 0.523，Specific Recall@20 为 0.692，全体
+Recall@5/20 分别为 0.465/0.623；建索引约 0.805 秒，检索约 31.119 秒。默认单元
+测试仍使用合成同 ID 语料，不依赖 1.26 GB 本地缓存；完整联网回归 231 项通过、
+0 跳过。
 
 ## 检索资源测量
 

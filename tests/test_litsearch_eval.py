@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from evals.litsearch import (
     evaluate_litsearch,
     format_litsearch_report,
+    load_litsearch_queries,
     load_litsearch_results,
 )
 
@@ -102,6 +103,20 @@ class LitSearchEvaluationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "quality must be 1 or 2"):
             evaluate_litsearch(invalid)
+
+    def test_query_loader_accepts_records_before_retrieval(self):
+        with TemporaryDirectory() as directory:
+            query_path = Path(directory) / "queries.json"
+            query = {
+                key: value
+                for key, value in FIXTURE[0].items()
+                if key != "retrieved"
+            }
+            query_path.write_text(json.dumps([query]), encoding="utf-8")
+
+            loaded = load_litsearch_queries(query_path)
+
+        self.assertEqual(loaded, [query])
 
     def test_report_and_cli_have_human_and_json_outputs(self):
         report = format_litsearch_report(evaluate_litsearch(FIXTURE))

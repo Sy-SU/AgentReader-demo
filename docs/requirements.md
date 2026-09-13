@@ -10,6 +10,7 @@
 均已完成。V3 已完成 Plan 纯数据层、Planner 输入边界、Runtime 可信 Plan 创建、
 最小 step Executor、DeepSeek thinking 多步消息协议、有限 Replan、blocked，以及
 Checkpoint 与 `--resume`、终端任务控制、扩展事件、规划评测和真实多论文验收。
+V3.1/V3.2 已补充分层运行健康分、LitSearch 同语料基线及结构化 Agent 任务成功率。
 
 ## 2. 学习目标
 
@@ -77,6 +78,9 @@ Agent = LLM + Tools + Loop + State
 - 首先查询 arXiv Atom API。
 - query 包含标准数字 arXiv ID 时，应使用 `id_list` 定向查询。
 - arXiv 返回 HTTP 429 时，应等待服务建议或默认间隔后重试一次。
+- 明确 arXiv ID 的 Atom API 请求不可用时，应从有界的官方 arxiv.org 摘要页读取
+  citation metadata，并校验返回 ID 与请求 ID 一致；页面超限、缺字段或 ID 不一致
+  时不得生成可信候选。
 - arXiv 不可用或没有结果时查询 Crossref。
 - 因 arXiv 不可用而回退时，结果应包含简短的 `arxiv_error` 诊断信息。
 - 普通关键词搜索从来源最多获取 10 篇候选；明确 arXiv ID 时只获取 1 篇。
@@ -467,6 +471,65 @@ Tool error 或 `run_failed` 只降低其对应的可解释维度。
 
 2026-09-13 完整联网验收在项目 Conda 环境运行 219 项测试，真实 arXiv、DeepSeek
 thinking 和双 PDF 系统用例全部执行，219 项全部通过、0 跳过。
+
+### FR-21：V3.2 LitSearch 同语料检索基线（Step 1 已实现）
+
+- benchmark adapter 必须只位于 `evals/`，不得替换或改变 production
+  arXiv/Crossref `search_paper`。
+- corpus 输入必须是 JSON/JSONL，包含唯一正整数 `corpusid`、字符串或 null
+  `title` 和 `abstract`；官方空文本记录必须保留在固定 ID 空间，重复 ID、超限
+  文本和非投影的大文件必须被拒绝。
+- query 输入复用 LitSearch 的 `query`、`query_set`、`specificity`、`quality` 和
+  gold `corpusids` 校验，但在检索前不要求 `retrieved`。
+- 轻量 baseline 使用当前 Python SQLite 的 FTS5、Porter tokenizer 和 BM25 排序；
+  它必须使用独立方法名，并显式声明不等于官方 NLTK + `rank_bm25` baseline。
+- 每个 query 必须生成至少 Top-20、最多 Top-200，避免用候选深度不足的列表计算
+  Recall@20；匹配不足时按固定 corpus 顺序确定性补齐。
+- 输出必须保留 Semantic Scholar corpus ID，能够直接交给 FR-20 scorer；可选使用
+  原子写入保存官方形状 JSON/JSONL。
+- CLI 必须支持查询数量限制、结果输出和完整 JSON 报告；默认不访问网络、不调用
+  LLM，也不读取 Agent State 或个人文献库。
+- `data/evals/` 必须被 Git 忽略。官方数据下载、全 597-query 实跑和正式指标记录
+  属于 V3.2 Step 2，在完成前不得声称已有 AgentReader 全量 LitSearch 基线。
+
+2026-09-13 Step 1 验收在项目 Conda 环境运行 226 项完整联网测试，真实 arXiv、
+DeepSeek、Thinking 和双 PDF 系统用例全部执行，226 项全部通过、0 跳过。
+
+### FR-22：V3.2 官方数据准备与首次基线（已实现）
+
+- 数据下载依赖必须位于 `environment-benchmark.yml` 的独立 Conda 环境，不得加入
+  主应用 `environment.yml`。
+- 数据集必须固定 revision；只下载 `query` 和 `corpus_clean`，不得下载更大的
+  `corpus_s2orc`。
+- Parquet 必须流式投影 query 契约及 `corpusid/title/abstract`，不得把 full paper
+  写入评测输入。
+- 投影必须原子写入、校验 597/64,183 记录并生成文件大小与 SHA-256 元数据；缓存、
+  投影和结果都位于被 Git 忽略的 `data/evals/`。
+- 首次基线必须先通过 20-query smoke test，再运行 597-query 全集并用 FR-20 scorer
+  独立复算。
+- 2026-09-13 固定基线为 Broad R@20=0.424、Specific R@5=0.523、Specific
+  R@20=0.692、全体 R@5=0.465、全体 R@20=0.623；它是 AgentReader SQLite
+  FTS5 基线，不是官方 BM25 数值。
+- Step 2 完整离线验收为 231 项通过、5 项联网按开关跳过；完整联网验收为
+  231 项通过、0 跳过。
+
+### FR-23：V3.2 Agent 层结构化任务成功率（已实现）
+
+- task case 必须是版本化 JSON，显式声明 goal、受控执行 fixture 和结构化期望。
+- scorer 只能读取最终 Plan 状态、Assistant Tool Call 和可信 Tool Result；不得读取
+  reasoning，不得用另一个 LLM 评分，也不得从自由文本推断论文标题是否正确。
+- 至少分别报告任务完成、Tool 使用、gold 候选发现、下载选择、页码证据和无结果
+  安全停止；不适用维度必须为 `N/A`，不能按失败计分。
+- 报告只能保留有界 ID、Tool 名、计数和页码，不得复制摘要、chunk 正文、API Key
+  或本地文件路径。
+- 确定性 runner 必须经过正式 Runtime；只固定 Provider 决策和 Tool 外部数据，不得
+  复制一套只为评测服务的 Agent Loop。
+- 评测 CLI 必须支持按 case 过滤、`--json` 和 `--debug`；Debug 只能在 case 已提供
+  gold 时显示任务正确性分数。普通 `main.py --debug` 仍只显示运行健康度。
+- 真实 DeepSeek 双论文验收可以复用 scorer，但原有真实 arXiv、双 PDF、页码引用
+  和最终回答断言不得被 scorer 替代或放宽。
+- 最新固定 task suite 为 3/3、平均 100 分；完整离线测试共 247 项，其中 5 项联网
+  按开关跳过；完整 arXiv + DeepSeek 联网验收 247 项全部通过、0 跳过。
 
 ## 4. 状态需求
 

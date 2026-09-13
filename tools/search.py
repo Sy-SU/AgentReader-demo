@@ -14,7 +14,10 @@ from .library import paper_id
 
 
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
+ARXIV_ABS_URL = "https://arxiv.org/abs"
 ARXIV_TIMEOUT_SECONDS = 8
+ARXIV_ABS_TIMEOUT_SECONDS = 10
+MAX_ARXIV_ABS_BYTES = 2 * 1024 * 1024
 ARXIV_RETRY_DELAY_SECONDS = 3
 MAX_ARXIV_RETRY_DELAY_SECONDS = 10
 CROSSREF_API_URL = "https://api.crossref.org/works"
@@ -38,6 +41,7 @@ def search_paper(query: str) -> dict:
     if not normalized_query:
         raise ValueError("Search query must not be empty.")
 
+    queried_arxiv_id = _extract_arxiv_id(normalized_query)
     try:
         arxiv_result = _parse_arxiv_results(
             _fetch_arxiv_feed(normalized_query),
@@ -45,6 +49,17 @@ def search_paper(query: str) -> dict:
         )
     except RuntimeError as error:
         arxiv_status = str(error)
+        if queried_arxiv_id:
+            try:
+                return _parse_arxiv_abs_page(
+                    _fetch_arxiv_abs_page(queried_arxiv_id),
+                    queried_arxiv_id,
+                    query=normalized_query,
+                )
+            except RuntimeError as page_error:
+                arxiv_status = (
+                    f"{arxiv_status}; arxiv.org fallback: {page_error}"
+                )
         fallback_reason = "arxiv_unavailable"
     else:
         if arxiv_result["found"]:
@@ -114,6 +129,35 @@ def _extract_arxiv_id(query: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _fetch_arxiv_abs_page(arxiv_id: str) -> bytes:
+    """Fetch bounded official HTML metadata for an explicit arXiv ID."""
+    request = Request(
+        f"{ARXIV_ABS_URL}/{arxiv_id}",
+        headers={"User-Agent": "AgentReaderDemo/1.0"},
+    )
+    try:
+        with urlopen(request, timeout=ARXIV_ABS_TIMEOUT_SECONDS) as response:
+            declared_size = response.headers.get("Content-Length")
+            if declared_size is not None:
+                try:
+                    if int(declared_size) > MAX_ARXIV_ABS_BYTES:
+                        raise RuntimeError("arXiv abstract page is too large.")
+                except ValueError:
+                    pass
+            payload = response.read(MAX_ARXIV_ABS_BYTES + 1)
+    except HTTPError as error:
+        raise RuntimeError(
+            f"arXiv abstract page returned HTTP {error.code}."
+        ) from error
+    except (URLError, TimeoutError, OSError) as error:
+        raise RuntimeError(
+            f"Could not reach arXiv abstract page: {error}"
+        ) from error
+    if len(payload) > MAX_ARXIV_ABS_BYTES:
+        raise RuntimeError("arXiv abstract page is too large.")
+    return payload
+
+
 def _arxiv_retry_delay(error: HTTPError) -> float:
     retry_after = error.headers.get("Retry-After") if error.headers else None
     try:
@@ -177,6 +221,52 @@ def _parse_arxiv_results(feed: bytes, query: str) -> dict:
         for entry in entries[:MAX_SEARCH_CANDIDATES]
     ]
     return _search_result(source="arxiv", papers=papers, query=query)
+
+
+def _parse_arxiv_abs_page(
+    page: bytes,
+    arxiv_id: str,
+    *,
+    query: str,
+) -> dict:
+    """Parse citation metadata from the official arXiv abstract page."""
+    parser = _ArxivCitationParser()
+    try:
+        parser.feed(page.decode("utf-8", errors="replace"))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("arXiv abstract page is invalid HTML.") from error
+
+    expected_id = _base_arxiv_id(arxiv_id)
+    observed_id = _base_arxiv_id(parser.single("citation_arxiv_id"))
+    title = _collapse_whitespace(parser.single("citation_title"))
+    pdf_url = _https_url(parser.single("citation_pdf_url"))
+    if (
+        observed_id != expected_id
+        or not title
+        or not pdf_url.startswith("https://arxiv.org/pdf/")
+    ):
+        raise RuntimeError("arXiv abstract metadata is incomplete or mismatched.")
+
+    authors = [
+        _collapse_whitespace(author)
+        for author in parser.values("citation_author")
+        if _collapse_whitespace(author)
+    ]
+    published = parser.single("citation_date").replace("/", "-") or None
+    paper = {
+        "source": "arxiv",
+        "arxiv_id": parser.single("citation_arxiv_id"),
+        "doi": None,
+        "title": title,
+        "authors": authors,
+        "abstract": (
+            _collapse_whitespace(parser.single("citation_abstract")) or None
+        ),
+        "published": published,
+        "paper_url": f"https://arxiv.org/abs/{arxiv_id}",
+        "pdf_url": pdf_url,
+    }
+    return _search_result(source="arxiv", papers=[paper], query=query)
 
 
 def _parse_arxiv_entry(entry: ET.Element) -> dict:
@@ -483,3 +573,40 @@ def _strip_markup(value: str) -> str:
     parser = _MarkupTextExtractor()
     parser.feed(value)
     return _collapse_whitespace(" ".join(parser.parts))
+
+
+class _ArxivCitationParser(HTMLParser):
+    _ALLOWED_NAMES = frozenset(
+        {
+            "citation_title",
+            "citation_author",
+            "citation_date",
+            "citation_pdf_url",
+            "citation_arxiv_id",
+            "citation_abstract",
+        }
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._metadata: dict[str, list[str]] = {}
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if tag.casefold() != "meta":
+            return
+        attributes = {name.casefold(): value for name, value in attrs}
+        name = attributes.get("name")
+        content = attributes.get("content")
+        if name in self._ALLOWED_NAMES and isinstance(content, str):
+            self._metadata.setdefault(name, []).append(content)
+
+    def single(self, name: str) -> str:
+        values = self._metadata.get(name, [])
+        return values[0] if values else ""
+
+    def values(self, name: str) -> list[str]:
+        return list(self._metadata.get(name, []))

@@ -25,6 +25,33 @@ LITSEARCH_REPOSITORY_URL = "https://github.com/princeton-nlp/LitSearch"
 
 def load_litsearch_results(path: str | Path) -> list[dict]:
     """Load official-style LitSearch retrieval results from JSON or JSONL."""
+    records = _load_json_records(path)
+    normalized = [
+        _normalize_record(record, index, require_retrieved=True)
+        for index, record in enumerate(records)
+    ]
+    if not normalized:
+        raise ValueError("LitSearch results must contain at least one record.")
+    return normalized
+
+
+def load_litsearch_queries(path: str | Path) -> list[dict]:
+    """Load official LitSearch queries before retrieval has been run."""
+    return normalize_litsearch_queries(_load_json_records(path))
+
+
+def normalize_litsearch_queries(records: Iterable[dict]) -> list[dict]:
+    """Validate in-memory LitSearch query records without predictions."""
+    normalized = [
+        _normalize_record(record, index, require_retrieved=False)
+        for index, record in enumerate(records)
+    ]
+    if not normalized:
+        raise ValueError("LitSearch queries must contain at least one record.")
+    return normalized
+
+
+def _load_json_records(path: str | Path) -> list[object]:
     result_path = Path(path)
     if result_path.suffix.casefold() == ".jsonl":
         records = []
@@ -50,15 +77,8 @@ def load_litsearch_results(path: str | Path) -> list[dict]:
             ) from error
         records = _records_from_payload(payload)
     else:
-        raise ValueError("LitSearch results must use .json or .jsonl.")
-
-    normalized = [
-        _normalize_record(record, index)
-        for index, record in enumerate(records)
-    ]
-    if not normalized:
-        raise ValueError("LitSearch results must contain at least one record.")
-    return normalized
+        raise ValueError("LitSearch input must use .json or .jsonl.")
+    return records
 
 
 def evaluate_litsearch(
@@ -67,7 +87,7 @@ def evaluate_litsearch(
 ) -> dict:
     """Evaluate ranked corpus IDs with LitSearch's macro Recall@K."""
     normalized_records = [
-        _normalize_record(record, index)
+        _normalize_record(record, index, require_retrieved=True)
         for index, record in enumerate(records)
     ]
     if not normalized_records:
@@ -224,7 +244,12 @@ def _records_from_payload(payload: object) -> list[object]:
     )
 
 
-def _normalize_record(record: object, index: int) -> dict:
+def _normalize_record(
+    record: object,
+    index: int,
+    *,
+    require_retrieved: bool,
+) -> dict:
     if (
         isinstance(record, dict)
         and isinstance(record.get("row"), dict)
@@ -255,20 +280,21 @@ def _normalize_record(record: object, index: int) -> dict:
         f"LitSearch record {index} corpusids",
         allow_empty=False,
     )
-    retrieved = _normalize_corpusids(
-        record.get("retrieved"),
-        f"LitSearch record {index} retrieved",
-        allow_empty=True,
-        allow_duplicates=True,
-    )
-    return {
+    normalized = {
         "query": query.strip(),
         "query_set": query_set.strip(),
         "specificity": specificity,
         "quality": quality,
         "corpusids": corpusids,
-        "retrieved": retrieved,
     }
+    if require_retrieved:
+        normalized["retrieved"] = _normalize_corpusids(
+            record.get("retrieved"),
+            f"LitSearch record {index} retrieved",
+            allow_empty=True,
+            allow_duplicates=True,
+        )
+    return normalized
 
 
 def _normalize_corpusids(

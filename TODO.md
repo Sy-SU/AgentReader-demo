@@ -459,3 +459,44 @@ corpus ID。AgentReader 当前在线源使用 arXiv ID/DOI 且只返回 Top-3，
 
 验收结果：2026-09-13 在 `agent-reader-demo` Conda 环境中启用真实 arXiv 与
 DeepSeek，完整 219 项测试全部通过、0 跳过。
+
+---
+
+## 10. V3.2：LitSearch 同语料 Benchmark 闭环（已完成）
+
+目标是让项目自己在 LitSearch 固定 corpus ID 空间生成检索结果，而不再只消费
+其他 retriever 已经生成的 JSONL。
+
+### Step 1：轻量同语料检索基线（已完成）
+
+- [x] 增加严格的原始 query loader；没有 `retrieved` 的官方 query 记录可直接加载。
+- [x] 接受只包含 `corpusid`、`title`、`abstract` 的 JSON/JSONL corpus 导出。
+- [x] 使用 Python 自带 SQLite FTS5 + Porter tokenizer 建立 evaluation-only 索引。
+- [x] 至少生成 Top-20 Semantic Scholar corpus IDs，并直接复用 V3.1 scorer。
+- [x] 支持 `--limit` smoke test、`--output` 官方形状结果和 `--json` 完整报告。
+- [x] 明确标记该实现不是 LitSearch 官方 NLTK + `rank_bm25` baseline。
+- [x] production arXiv/Crossref Tool、Runtime、State 和 Provider 均不改变。
+
+### Step 2：官方数据准备与首次基线（已完成）
+
+- [x] 在独立 Conda benchmark 环境中下载官方 query 和 `corpus_clean`。
+- [x] 只导出 title/abstract 必要字段，不把 full paper 或大数据提交 Git。
+- [x] 先运行 20-query smoke test，再运行全部 597 queries。
+- [x] 保存环境、语料版本、命令、耗时和 Recall 指标，形成可复现基线。
+- [x] 只有相同 corpus、query set 和 ID 空间的结果才与后续版本比较。
+
+### Step 3：Agent 层任务成功率（已完成）
+
+- [x] 定义严格、版本化的 task case 与纯结构化 scorer。
+- [x] 覆盖搜索成功、无结果安全停止、多论文证据比较三类正式 Runtime 场景。
+- [x] 分别评分完成、Tool 使用、gold 候选、下载选择、页码证据和无结果行为。
+- [x] 增加人类可读、`--json` 和带有界观察值的 `--debug` CLI。
+- [x] 将 scorer 接入真实 DeepSeek 双论文系统验收，但不放宽原有文本与页码断言。
+- [x] 不从自由文本中做脆弱标题匹配，也不默认用 LLM-as-a-Judge 生成总分。
+- [x] 完成离线全量与 arXiv + DeepSeek 联网全量验收并同步文档。
+
+当前基线：固定 LitSearch revision `9573fb284a1026c998df47024b888a163f0f0e25`，
+64,183 篇、597 queries；Broad R@20=0.424，Specific R@5=0.523、R@20=0.692，
+全体 R@5=0.465、R@20=0.623；索引 0.805 秒、检索 31.119 秒。Step 3 固定
+Agent task suite 为 3/3、平均 100 分；最新完整离线测试共 247 项，5 项联网按开关
+跳过；完整联网测试 247 项全部通过、0 跳过。
